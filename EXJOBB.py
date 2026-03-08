@@ -97,37 +97,24 @@ def prepare_joint_dataframe(
 #vi skapar en ny "klass" i python där vi tar med ett färdigt ramverk för state space-modeller och bara behöver specificera just vår modell
 #VAR KOMMER det färdiga ramverket ifrån?
 class GroundwaterSSM(MLEModel):
-    """
-    Custom Kalman Filter för grundvattennivå med referensrör.
 
-    Tillståndsvektor (k_states = 2 + nseason + 1):
-        [0] µ          – lokal nivå (m ö.h.)
-        [1] ν          – lokal trend (m/vecka)
-        [2] γ_0        – aktuell säsongskomponent
-        [3..s-1]       – laggade säsongskomponenter
-        [s]  α         – latent aquifer-komponent
 
-    Observationsvektor (k_endog = 2):
-        y[0] = basobjekt  (22W102)   – direkt nivåmätning
-        y[1] = referensobjekt (95_2) – korrelerad nivåmätning
-    """
-
+#Nedan är en lista med namnen på de 4 parametrar som modellen ska skatta
+#alla sigma2 variabler skattas utifrån basröret
+#sigma2 epsilon (sigma2 eps) skattar mätfelet för referensröret
+#sigma2_eps_base är låst till 0 (basrörets mätningar antas vara exakta)
+#trend-komponenten är borttagen: µ(t+1) = µ(t) + η_level(t)
     param_names = [
         "sigma2_eta_level",   # process noise: nivå
-        "sigma2_eta_trend",   # process noise: trend
         "sigma2_eta_season",  # process noise: säsong
-        "sigma2_eta_aquifer", # process noise: latent aquifer
-        "sigma2_eps_base",    # obs noise: basobjekt
         "sigma2_eps_ref",     # obs noise: referensobjekt
-        "phi_trend",          # AR(1) för trend (dämpning)
-        "rho_aquifer",        # AR(1) för latent aquifer
         "beta_ref",           # koppling nivå → referens
-        "gamma_ref",          # koppling aquifer → referens
     ]
 
     def __init__(self, endog, nseason=26, **kwargs):
         self.nseason = nseason
-        k_states = 2 + nseason + 1  # nivå, trend, nseason säsongslägen, aquifer
+        #nedan beräknas antalet states med 26 st säsonger blir det 26+1(nivå) = 27 states
+        k_states = 1 + nseason
         k_posdef = k_states
 
         super().__init__(
@@ -137,71 +124,76 @@ class GroundwaterSSM(MLEModel):
             **kwargs,
         )
 
-        self.idx_level   = 0
-        self.idx_trend   = 1
-        self.idx_season  = slice(2, 2 + nseason)
-        self.idx_aquifer = 2 + nseason
+#nedan sparas var i tillståndsekvationen som varje komponent sitter
+        self.idx_level  = 0
+        self.idx_season = slice(1, 1 + nseason)
 
-        # Diffus initiering för nivå/trend (okänt startvärde)
+        # Diffus initiering för nivå (okänt startvärde)
         self.ssm.initialize_approximate_diffuse()
 
     @property
     def start_params(self):
-        y_std = np.nanstd(self.endog[:, 0])
+        import statsmodels.api as sm
+
+        y1 = self.endog[:, 0]  # basröret 22W102
+        y2 = self.endog[:, 1]  # referensröret 95_2
+
+        # Steg 1-3: Anpassa univariat strukturmodell till basröret
+        # Detta ger oss databaserade startgissningar för varianser och säsong
+        mod = sm.tsa.UnobservedComponents(
+            y1, level="local level", seasonal=self.nseason
+        )
+        res = mod.fit(disp=False, method="nm", maxiter=500)
+
+        sigma2_eta_level  = float(res.params[1])  # process noise nivå
+        sigma2_eta_season = float(res.params[2])  # process noise säsong
+
+        # Steg 5: OLS för laddningsparameter beta_ref
+        level     = res.level.smoothed
+        season    = res.seasonal.smoothed
+        y2_deseas = y2 - season
+
+        # mask använder level (samma längd som y2_deseas)
+        mask = ~(np.isnan(y2_deseas) | np.isnan(level))
+        X    = level[mask].reshape(-1, 1)
+        ols  = np.linalg.lstsq(X, y2_deseas[mask], rcond=None)
+        beta_ref = float(ols[0][0])
+        sigma2_eps_ref = float(np.var(y2_deseas[mask] - X.flatten() * beta_ref))
+
         return np.array([
-            (0.02 * y_std) ** 2,  # sigma2_eta_level
-            (0.005 * y_std) ** 2, # sigma2_eta_trend
-            (0.01 * y_std) ** 2,  # sigma2_eta_season
-            (0.05 * y_std) ** 2,  # sigma2_eta_aquifer
-            (0.1 * y_std) ** 2,   # sigma2_eps_base
-            (0.15 * y_std) ** 2,  # sigma2_eps_ref
-            0.95,                 # phi_trend
-            0.90,                 # rho_aquifer
-            0.85,                 # beta_ref
-            0.30,                 # gamma_ref
+            sigma2_eta_level,    # process noise: nivå
+            sigma2_eta_season,   # process noise: säsong
+            sigma2_eps_ref,      # obs noise: referensröret
+            beta_ref,            # koppling nivå → referens
         ])
 
     @property
     def param_bounds(self):
         return [
             (1e-6, None),    # sigma2_eta_level
-            (1e-6, None),    # sigma2_eta_trend
             (1e-6, None),    # sigma2_eta_season
-            (1e-6, None),    # sigma2_eta_aquifer
-            (1e-6, None),    # sigma2_eps_base
             (1e-6, None),    # sigma2_eps_ref
-            (-0.999, 0.999), # phi_trend
-            (-0.95, 0.95),   # rho_aquifer (begränsat för stabilitet)
             (None, None),    # beta_ref
-            (None, None),    # gamma_ref
         ]
 
-#CLAUDE FÖRKLARAR HIT
-
-
+#FORTSÄTT FÖRKLARA DENNA KOD FRÅN OCH MED IMORGON 
 
     def transform_params(self, unconstrained):
         p = unconstrained.copy()
         # Varianser: exp-transform → alltid positiva
-        p[:6] = np.exp(unconstrained[:6])
-        # AR-koefficienter: tanh → (-1, 1)
-        p[6] = np.tanh(unconstrained[6])
-        p[7] = np.tanh(unconstrained[7])
+        p[:3] = np.exp(unconstrained[:3])
         return p
 
     def untransform_params(self, constrained):
         p = constrained.copy()
-        p[:6] = np.log(constrained[:6])
-        p[6] = np.arctanh(constrained[6])
-        p[7] = np.arctanh(constrained[7])
+        p[:3] = np.log(constrained[:3])
         return p
 
     def update(self, params, **kwargs):
         params = super().update(params, **kwargs)
 
-        (s2_level, s2_trend, s2_season, s2_aquifer,
-         s2_base, s2_ref, phi_trend, rho_aquifer,
-         beta_ref, gamma_ref) = params
+        (s2_level, s2_season,
+         s2_ref, beta_ref) = params
 
         ns = self.nseason
         k  = self.k_states
@@ -209,45 +201,36 @@ class GroundwaterSSM(MLEModel):
         # ── Transitionsmatris T ──────────────────────────────────────────
         T = np.zeros((k, k))
 
-        # Nivå: µ(t+1) = µ(t) + ν(t)
+        # Nivå: µ(t+1) = µ(t)  (random walk utan trend)
         T[0, 0] = 1.0
-        T[0, 1] = 1.0
-
-        # Trend: ν(t+1) = phi * ν(t)
-        T[1, 1] = phi_trend
 
         # Säsong med summavillkor:
         #   γ_0(t+1) = -γ_0(t) - γ_1(t) - ... - γ_{s-2}(t)
         #   γ_j(t+1) = γ_{j-1}(t)  för j=1..s-1
-        T[2, 2:2+ns] = -1.0
+        T[1, 1:1+ns] = -1.0
         for j in range(1, ns):
-            T[2 + j, 2 + j - 1] = 1.0
-
-        # Latent aquifer: α(t+1) = rho * α(t)
-        T[k-1, k-1] = rho_aquifer
+            T[1 + j, 1 + j - 1] = 1.0
 
         self.ssm["transition"] = T
 
         # ── Observationsmatris Z ─────────────────────────────────────────
         # y_base = µ + γ_0          (direkt nivå + säsong)
-        # y_ref  = beta*µ + gamma*α (referens kopplad via nivå & aquifer)
+        # y_ref  = beta*µ            (referens kopplad via nivå)
         Z = np.zeros((2, k))
-        Z[0, 0] = 1.0          # base ← nivå
-        Z[0, 2] = 1.0          # base ← säsong
-        Z[1, 0] = beta_ref     # ref  ← nivå
-        Z[1, k-1] = gamma_ref  # ref  ← latent aquifer
+        Z[0, 0] = 1.0      # base ← nivå
+        Z[0, 1] = 1.0      # base ← säsong
+        Z[1, 0] = beta_ref # ref  ← nivå
 
         self.ssm["design"] = Z
 
         # ── Observationsbrus ────────────────────────────────────────────
-        self.ssm["obs_cov"] = np.diag([s2_base, s2_ref])
+        # sigma2_eps_base är låst till 0: basrörets mätningar antas exakta
+        self.ssm["obs_cov"] = np.diag([0.0, s2_ref])
 
         # ── Processkörsbrus Q ───────────────────────────────────────────
         Q = np.zeros((k, k))
         Q[0, 0] = s2_level
-        Q[1, 1] = s2_trend
-        Q[2, 2] = s2_season  # brus enbart på den aktuella säsongskomponenten
-        Q[k-1, k-1] = s2_aquifer
+        Q[1, 1] = s2_season  # brus enbart på den aktuella säsongskomponenten
         self.ssm["state_cov"] = Q
 
         # ── Selektionsmatris = identitetsmatris ─────────────────────────
@@ -266,7 +249,7 @@ def fit_model(df: pd.DataFrame, nseason: int = 26) -> tuple:
 
     print("Anpassar modellen (MLE med Kalman filter)...")
     result = model.fit(
-        method="nm",
+        method="lbfgs",
         maxiter=2000,
         disp=True,
     )
@@ -281,16 +264,25 @@ def smooth_and_forecast(result, df: pd.DataFrame, n_forecast: int = 26) -> dict:
     level_smoothed = smoothed.smoothed_state[0]
     level_var      = smoothed.smoothed_state_cov[0, 0]
 
-    pred        = result.get_prediction()
-    pred_ci_arr = np.array(pred.conf_int(alpha=0.05))
-    # Väljer kolumn 0 (base lower) och kolumn 2 (base upper) – ignorerar ref-intervallet
-    pred_ci     = np.column_stack([pred_ci_arr[:, 0], pred_ci_arr[:, 2]])
-    pred_mean   = np.array(pred.predicted_mean).flatten()
+    # Smoother-baserat prediktionsintervall (undviker explosioner vid saknade värden)
+    season_var = smoothed.smoothed_state_cov[1, 1]
+    total_var  = level_var + season_var
+    std        = np.sqrt(np.maximum(total_var, 0))
+    pred_mean  = level_smoothed + smoothed.smoothed_state[1]
+    pred_ci    = np.column_stack([
+        pred_mean - 1.96 * std,
+        pred_mean + 1.96 * std,
+    ])
 
-    forecast     = result.get_forecast(steps=n_forecast)
-    fcast_ci_arr = np.array(forecast.conf_int(alpha=0.05))
-    fcast_ci     = np.column_stack([fcast_ci_arr[:, 0], fcast_ci_arr[:, 2]])
-    fcast_mean   = np.array(forecast.predicted_mean).flatten()
+    # Smoother-baserad prognos: konstant nivå + växande osäkerhet från random walk
+    s2_level       = result.params[0]
+    last_std       = std[-1]
+    fcast_mean     = np.full(n_forecast, pred_mean[-1])
+    fcast_std      = np.sqrt(last_std**2 + np.arange(1, n_forecast + 1) * s2_level)
+    fcast_ci       = np.column_stack([
+        fcast_mean - 1.96 * fcast_std,
+        fcast_mean + 1.96 * fcast_std,
+    ])
 
     last_date = df.index[-1]
     fcast_idx = pd.date_range(
@@ -310,7 +302,6 @@ def smooth_and_forecast(result, df: pd.DataFrame, n_forecast: int = 26) -> dict:
         "fcast_index":    fcast_idx,
         "fcast_base":     fcast_mean,
         "fcast_ci":       fcast_ci,
-        "latent_aquifer": smoothed.smoothed_state[-1],
     }
 
 
@@ -355,7 +346,7 @@ def detect_anomalies(
 # ─────────────────────────────────────────────
 
 def plot_results(out: dict, anomaly: pd.Series, title_base: str = "22W102"):
-    fig, axes = plt.subplots(3, 1, figsize=(14, 14), sharex=False)
+    fig, axes = plt.subplots(2, 1, figsize=(14, 10), sharex=False)
     fig.suptitle(
         "Grundvatten State Space Model\n"
         f"Basobjekt: {title_base} | Referens: 95_2",
@@ -370,7 +361,6 @@ def plot_results(out: dict, anomaly: pd.Series, title_base: str = "22W102"):
     f_vals   = out["fcast_base"].flatten()[:len(f_idx)]
     f_ci     = out["fcast_ci"][:len(f_idx)]
     smoothed = out["level_smoothed"].flatten()[:len(idx)]
-    latent   = out["latent_aquifer"].flatten()[:len(idx)]
 
     # ── Panel 1: Observationer, Kalman-smoother, Prognos ─────────────────
     ax = axes[0]
@@ -428,18 +418,6 @@ def plot_results(out: dict, anomaly: pd.Series, title_base: str = "22W102"):
     plt.setp(ax2.xaxis.get_majorticklabels(), rotation=30)
     ax2.grid(alpha=0.3)
     ax2.set_ylim(-2, 2)
-
-    # ── Panel 3: Latent aquifer-komponent (marktyp/jordart) ──────────────
-    ax3 = axes[2]
-    ax3.set_title("Latent aquifer-komponent α(t)  [marktyp / jordart]", fontsize=11)
-    ax3.plot(idx, latent, color="saddlebrown", lw=1.5)
-    ax3.axhline(0, color="black", lw=0.5, linestyle="--")
-    ax3.set_ylabel("α (dimensionslös)")
-    ax3.set_xlabel("Datum")
-    ax3.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
-    ax3.xaxis.set_major_locator(mdates.MonthLocator(interval=4))
-    plt.setp(ax3.xaxis.get_majorticklabels(), rotation=30)
-    ax3.grid(alpha=0.3)
 
     plt.tight_layout()
     return fig
