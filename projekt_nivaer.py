@@ -80,12 +80,11 @@ def load_candidate_stations(
     base_series: pd.Series,
     base_station_id: str = "22W102",
     meta_path: Path = metadata_path,
-    min_overlap_weeks: int = 52,
 ) -> list:
     """
     Läser metadata för basröret, hämtar stationer med samma akvifer+jordart
     från SGU OGC API, och returnerar lista med (station_id, pd.Series)
-    för rör med tillräcklig överlappning med basröret.
+    för rör med överlappning med basröret.
     """
     import requests
     import urllib3
@@ -141,7 +140,7 @@ def load_candidate_stations(
                 s.index = s.index.tz_localize(None)
             s = pd.to_numeric(s, errors="coerce")
             overlap = s[(s.index >= base_start) & (s.index <= base_end)].dropna()
-            if len(overlap) >= min_overlap_weeks:
+            if len(overlap) > 0:
                 result.append((sid, s))
                 print(f"  ✓ {sid}: {len(overlap)} överlappande obs (cache)")
             if len(result) >= max_download:
@@ -157,11 +156,11 @@ def load_candidate_stations(
             try:
                 s = load_reference_station(sid)
                 overlap = s[(s.index >= base_start) & (s.index <= base_end)].dropna()
-                if len(overlap) >= min_overlap_weeks:
+                if len(overlap) > 0:
                     result.append((sid, s))
                     print(f"  ✓ {sid}: {len(overlap)} överlappande obs")
                 else:
-                    print(f"  ✗ {sid}: för få obs ({len(overlap)} < {min_overlap_weeks})")
+                    print(f"  ✗ {sid}: ingen överlappning")
             except Exception as e:
                 print(f"  ✗ {sid}: fel ({e})")
             time.sleep(2.0)
@@ -244,7 +243,7 @@ def prepare_joint_dataframe_multi(
     freq: str = "7D",
     # max antal referensrör — begränsar antalet parametrar i modellen
     # 4 rör × 4 parametrar + 2 = 18 parametrar totalt (hanterbart för optimeraren)
-    max_refs: int = 4,
+    max_refs: int = 5,
 ) -> pd.DataFrame:
     # Ta bort tidszon om den finns
     if base.index.tz is not None:
@@ -305,7 +304,7 @@ def prepare_joint_dataframe_multi(
 
 
 # ─────────────────────────────────────────────
-#  BASLINJEMODELL (ett referensrör: 95_2)
+#  BASLINJEMODELL (ett referensrör: topp-1 via Pearson-korrelation)
 # ─────────────────────────────────────────────
 
 #vi skapar en ny "klass" i python där vi tar med ett färdigt ramverk för state space-modeller och bara behöver specificera just vår modell
@@ -607,203 +606,6 @@ class GroundwaterSSM_Multi(MLEModel):
         R[1, 1] = 1.0  # η_season → state 1 (γ_0)
         self.ssm["selection"] = R
 
-
-# ─────────────────────────────────────────────
-#  MULTIVARIAT MODELL MED TIDSVARIERANDE β (TVP)
-# ─────────────────────────────────────────────
-
-#  Litteraturreferens: Durbin & Koopman (2012), kap. 3.4
-#  "Time Series Analysis by State Space Methods", 2nd ed.
-#
-#  Istället för konstant β_i skattas β_i(t) som en latent variabel
-#  (random walk), vilket fångar att den hydrauliska kopplingen mellan
-#  brunnar kan variera över tid.
-#
-#  Tillståndsvektor (27 + n_refs states):
-#    [µ, γ_0, …, γ_25, β_1(t), …, β_n(t)]
-#
-#  Observation:
-#    y_base  = µ + γ_0                                   (exakt, sigma2_eps=0)
-#    y_ref_i = alpha_i + β_i(t) · µ + gamma_i · γ_0     (med obs-brus)
-#
-#  OBS: β_i(t)·µ(t) är en produkt av två latenta tillstånd → icke-linjärt.
-#  Linearisering: vi approximerar µ(t) ≈ E[µ] ≈ mean(y_base) i Z-matrisen
-#  så att Z[ref_i, state_β_i] = µ_approx.  Kalman-filtret kompenserar delvis
-#  för approximationen via innovationsuppdateringen.
-
-class GroundwaterSSM_Multi_TVP(MLEModel):
-    """
-    Multivariat SSM med tidsvarierande β_i(t).
-    β_i(t) är latenta tillstånd som följer random walks.
-    Relaxerar antagande A6 (tidsinvarians i observationsekvationen).
-    """
-
-    def __init__(self, endog, nseason=26, ref_ids=None, **kwargs):
-        self.nseason = nseason
-        self.ref_ids = ref_ids if ref_ids is not None else []
-        self.n_refs  = len(self.ref_ids)
-
-        # States: µ + 26 säsong + n_refs tidsvarierande β_i(t)
-        k_states = 1 + nseason + self.n_refs
-        # Chockkällor: η_level + η_season + ζ_1 + … + ζ_n
-        self._k_posdef = 2 + self.n_refs
-
-        super().__init__(
-            endog,
-            k_states=k_states,
-            k_posdef=self._k_posdef,
-            **kwargs,
-        )
-
-        # Parameternamn:
-        #   2 processvarianser (nivå, säsong)
-        #   per ref: σ²_eps_i, σ²_zeta_i, alpha_i, gamma_i
-        # OBS: β_i är nu LATENT (inte en fast parameter)
-        self._param_names = ["sigma2_eta_level", "sigma2_eta_season"]
-        for rid in self.ref_ids:
-            self._param_names += [
-                f"sigma2_eps_{rid}",    # observationsbrus ref_i
-                f"sigma2_zeta_{rid}",   # processbrus för β_i(t)
-                f"alpha_{rid}",         # intercept ref_i
-                f"gamma_{rid}",         # säsongsladdning ref_i
-            ]
-
-        self.ssm.initialize_approximate_diffuse()
-
-    @property
-    def param_names(self):
-        return self._param_names
-
-    @property
-    def start_params(self):
-        import statsmodels.api as sm
-
-        y1 = self.endog[:, 0]
-
-        # Univariat modell för startgissning av processvarianser
-        mod = sm.tsa.UnobservedComponents(
-            y1, level="local level", seasonal=self.nseason
-        )
-        res = mod.fit(disp=False, method="nm", maxiter=500)
-
-        sigma2_eta_level  = float(res.params[1])
-        sigma2_eta_season = float(res.params[2])
-
-        params = [sigma2_eta_level, sigma2_eta_season]
-
-        level  = res.level.smoothed
-        season = res.seasonal.smoothed
-
-        # OLS per referensrör: y_ref = alpha + beta*level + gamma*season
-        for i in range(self.n_refs):
-            y_ref = self.endog[:, 1 + i]
-            mask  = ~(np.isnan(y_ref) | np.isnan(level) | np.isnan(season))
-            X     = np.column_stack([np.ones(mask.sum()), level[mask], season[mask]])
-            ols   = np.linalg.lstsq(X, y_ref[mask], rcond=None)
-            alpha_i  = float(ols[0][0])
-            gamma_i  = float(ols[0][2])
-            s2_eps_i = float(np.var(y_ref[mask] - X @ ols[0]))
-            # σ²_zeta startar litet — β_i(t) bör vara nästan konstant initialt
-            s2_zeta_i = 1e-4
-            params  += [max(s2_eps_i, 1e-6), s2_zeta_i, alpha_i, gamma_i]
-
-        return np.array(params)
-
-    def transform_params(self, unconstrained):
-        p = unconstrained.copy()
-        p[0] = np.exp(unconstrained[0])   # sigma2_eta_level > 0
-        p[1] = np.exp(unconstrained[1])   # sigma2_eta_season > 0
-        for i in range(self.n_refs):
-            base = 2 + 4 * i
-            p[base]     = np.exp(unconstrained[base])      # sigma2_eps_i > 0
-            p[base + 1] = np.exp(unconstrained[base + 1])  # sigma2_zeta_i > 0
-            # alpha_i, gamma_i obegränsade
-        return p
-
-    def untransform_params(self, constrained):
-        p = constrained.copy()
-        p[0] = np.log(constrained[0])
-        p[1] = np.log(constrained[1])
-        for i in range(self.n_refs):
-            base = 2 + 4 * i
-            p[base]     = np.log(constrained[base])
-            p[base + 1] = np.log(constrained[base + 1])
-        return p
-
-    def update(self, params, **kwargs):
-        params = super().update(params, **kwargs)
-
-        s2_level  = params[0]
-        s2_season = params[1]
-        ref_params = [
-            (params[2 + 4*i], params[3 + 4*i], params[4 + 4*i], params[5 + 4*i])
-            for i in range(self.n_refs)
-        ]
-        # ref_params[i] = (sigma2_eps_i, sigma2_zeta_i, alpha_i, gamma_i)
-
-        ns      = self.nseason        # 26
-        n_refs  = self.n_refs
-        k       = self.k_states       # 27 + n_refs
-        n_endog = 1 + n_refs
-        kp      = self._k_posdef      # 2 + n_refs
-
-        # ── Transitionsmatris T (k×k) ────────────────────────────────────
-        T = np.zeros((k, k))
-        T[0, 0] = 1.0                      # µ(t+1) = µ(t)
-        T[1, 1:1+ns] = -1.0                # Säsong: sum-to-zero (Harvey)
-        for j in range(1, ns):
-            T[1 + j, 1 + j - 1] = 1.0
-        for i in range(n_refs):
-            T[1 + ns + i, 1 + ns + i] = 1.0  # β_i(t+1) = β_i(t)
-        self.ssm["transition"] = T
-
-        # ── Observationsmatris Z (n_endog × k) ──────────────────────────
-        # y_base  = 1·µ + 1·γ_0
-        # y_ref_i = alpha_i + β_i(t)·µ + gamma_i·γ_0
-        #
-        # β_i(t)·µ(t) är icke-linjärt.  Linearisering:
-        #   Vi placerar β_i(t)-state i kolumnen och multiplicerar med
-        #   µ_approx ≈ mean(y_base).  Filtrets innovationsuppdatering
-        #   korrigerar avvikelsen.
-        Z = np.zeros((n_endog, k))
-        Z[0, 0] = 1.0   # base ← µ
-        Z[0, 1] = 1.0   # base ← γ_0
-
-        mu_approx = float(np.nanmean(self.endog[:, 0]))
-        for i, (_, _, _, gamma_i) in enumerate(ref_params):
-            Z[1 + i, 1 + ns + i] = mu_approx   # β_i(t) × µ_approx
-            Z[1 + i, 1]          = gamma_i      # γ_0 × gamma_i
-        self.ssm["design"] = Z
-
-        # ── Observationsintercept d (n_endog × 1) ───────────────────────
-        d = np.zeros((n_endog, 1))
-        for i, (_, _, alpha_i, _) in enumerate(ref_params):
-            d[1 + i, 0] = alpha_i
-        self.ssm["obs_intercept"] = d
-
-        # ── Observationsbrus H (n_endog × n_endog) ──────────────────────
-        H = np.zeros((n_endog, n_endog))
-        for i, (s2_eps_i, _, _, _) in enumerate(ref_params):
-            H[1 + i, 1 + i] = s2_eps_i
-        self.ssm["obs_cov"] = H
-
-        # ── Processkörsbrus Q (kp × kp) ─────────────────────────────────
-        Q = np.zeros((kp, kp))
-        Q[0, 0] = s2_level
-        Q[1, 1] = s2_season
-        for i, (_, s2_zeta_i, _, _) in enumerate(ref_params):
-            Q[2 + i, 2 + i] = s2_zeta_i
-        self.ssm["state_cov"] = Q
-
-        # ── Selektionsmatris R (k × kp) ─────────────────────────────────
-        R = np.zeros((k, kp))
-        R[0, 0] = 1.0          # η_level  → state 0 (µ)
-        R[1, 1] = 1.0          # η_season → state 1 (γ_0)
-        for i in range(n_refs):
-            R[1 + ns + i, 2 + i] = 1.0  # ζ_i → state 27+i (β_i)
-        self.ssm["selection"] = R
-
-
 # ─────────────────────────────────────────────
 #  ANPASSA OCH PREDIKTERA
 # ─────────────────────────────────────────────
@@ -847,26 +649,6 @@ def fit_model_multi(df: pd.DataFrame, nseason: int = 26) -> tuple:
     print(result.summary())
     return result, model
 
-
-def fit_model_tvp(df: pd.DataFrame, nseason: int = 26) -> tuple:
-    """Anpassar TVP-modellen (tidsvarierande β) och returnerar (result, model)."""
-    ref_ids = [col for col in df.columns if col != "base"]
-    endog   = df[["base"] + ref_ids].values.astype(float)
-
-    model = GroundwaterSSM_Multi_TVP(endog, nseason=nseason, ref_ids=ref_ids)
-
-    print(f"Anpassar TVP-modell med {len(ref_ids)} referensrör: {ref_ids}...")
-    print(f"Tillstånd: {model.k_states} (27 + {len(ref_ids)} tidsvarierande β)")
-    print(f"Parametrar: {len(model.param_names)}")
-    result = model.fit(
-        method="powell",
-        maxiter=5000,
-        disp=True,
-        cov_type="none",
-    )
-    print("\n" + "="*50)
-    print(result.summary())
-    return result, model
 
 
 def smooth_and_forecast(result, df: pd.DataFrame, n_forecast: int = 26) -> dict:
@@ -939,20 +721,16 @@ def evaluate_model(result, out: dict, label: str = "Modell") -> dict:
     Returnerar en dict med alla mått.
     Hanterar både univariata (baseline) och multivariata modeller.
 
-    Mått som beräknas:
-      ── Informationskriterier ──
-        Log-likelihood, AIC, BIC, HQIC
-      ── Prediktionsfel (basröret, one-step-ahead) ──
-        RMSE, MAE, ME (bias)  — filtrets prediktion ŷ(t|t-1)
-      ── Standardiserade innovationer (Kalman-filter) ──
-        Medelvärde, Std, Skevhet, Kurtosis  (bör vara ≈ N(0,1))
-      ── Restdiagnostik ──
-        Ljung-Box Q (lag 10), Durbin-Watson
-      ── Prediktionsintervall ──
-        95%-täckningsgrad (andel obs inom PI)
-      ── Latenta variabler (SSM-specifikt) ──
-        Medel osäkerhet i latent nivå µ(t)
-        Medel osäkerhet i säsong γ₀(t)
+    Utvärderar de tre antaganden som krävs för SSM
+    (Kap. 17, Applied Time Series Analysis, 2019):
+
+      Antagande 1 (§17.1): Initialtillstånd α₀ har E(α₀)=a₀, V(α₀)=P₀
+      Antagande 2 (§17.1): Feltermerna εₜ och ηₜ är okorrelerade med
+                            varandra i alla tidsperioder samt okorrelerade
+                            med initialtillståndet
+      Antagande 3 (§17.9): Feltermerna och initialtillståndet är
+                            normalfördelade (krävs för Kalmanfiltrets
+                            optimalitet)
     """
     from scipy import stats as sp_stats
 
@@ -966,7 +744,7 @@ def evaluate_model(result, out: dict, label: str = "Modell") -> dict:
     o = obs[valid]
     p = pred[valid]
 
-    # ── 1. Informationskriterier ─────────────────────────────────────
+    # ── Modellanpassning (informationskriterier + prediktionsfel) ─────
     metrics = {
         "Log-likelihood":    result.llf,
         "AIC":               result.aic,
@@ -976,96 +754,162 @@ def evaluate_model(result, out: dict, label: str = "Modell") -> dict:
         "Antal obs (T)":     int(result.nobs),
     }
 
-    # ── 2. Prediktionsfel (basröret, in-sample) ──────────────────────
     resid = o - p
-    metrics["RMSE"]       = float(np.sqrt(np.mean(resid**2)))
-    metrics["MAE"]        = float(np.mean(np.abs(resid)))
-    metrics["ME (bias)"]  = float(np.mean(resid))
 
-    # ── 3. Standardiserade innovationer från Kalman-filtret ──────────
-    #   Dessa är e(t) / sqrt(F(t)) — bör vara ≈ N(0,1) om modellen
-    #   är korrekt specificerad.  Rad 0 = basröret.
+    # Hoppa över den diffusa initieringsperioden (första nseason tidsteg)
+    # där Kalman-filtret ännu inte konvergerat (P₀ = 10⁶·I)
+    try:
+        nseason = result.model.nseason
+    except AttributeError:
+        nseason = 26
+    burn = min(nseason, len(resid) - 10)  # behåll minst 10 obs
+    resid_eval = resid[burn:]
+
+    metrics["RMSE"]       = float(np.sqrt(np.mean(resid_eval**2)))
+    metrics["MAE"]        = float(np.mean(np.abs(resid_eval)))
+    metrics["ME (bias)"]  = float(np.mean(resid_eval))
+
+    # Prediktionsintervallets täckningsgrad (efter burn-in)
+    ci_lower = ci[valid, 0][burn:]
+    ci_upper = ci[valid, 1][burn:]
+    o_eval   = o[burn:]
+    inside   = (o_eval >= ci_lower) & (o_eval <= ci_upper)
+    metrics["95%-täckning"] = float(inside.mean())
+
+    # ── Standardiserade innovationer e(t)/√F(t) ─────────────────────
+    #   Används för att testa antagande 2 och 3.
+    si_valid = None
     try:
         std_innov = result.filter_results.standardized_forecasts_error
         # std_innov shape: (k_endog, T)  —  ta rad 0 (basröret)
         si_base = std_innov[0]
-        si_valid = si_base[~np.isnan(si_base)]
-        if len(si_valid) > 10:
-            metrics["Innov. medel"]   = float(np.mean(si_valid))
-            metrics["Innov. std"]     = float(np.std(si_valid))
-            metrics["Innov. skevhet"] = float(sp_stats.skew(si_valid))
-            metrics["Innov. kurtosis"] = float(sp_stats.kurtosis(si_valid, fisher=True))
+        # Hoppa över diffus initieringsperiod även för innovationer
+        si_after_burn = si_base[burn:]
+        si_valid = si_after_burn[~np.isnan(si_after_burn)]
+        if len(si_valid) <= 10:
+            si_valid = None
     except Exception:
         pass
 
-    # ── 4. Ljung-Box test (lag 10) för autokorrelation i residualer ──
+    # ── Antagande 1 (§17.1): Initialtillstånd ───────────────────────
+    #   E(α₀) = a₀ och V(α₀) = P₀.
+    #   Våra modeller använder approximate diffuse initialization:
+    #   a₀ = 0, P₀ = κ·I (κ = 10⁶) — standardmetod när ingen
+    #   förhandsinformation om α₀ finns tillgänglig.
+    metrics["A1 uppfyllt"] = True    # per modellspecifikation
+
+    # ── Antagande 2 (§17.1): Okorrelerade feltermer ─────────────────
+    #   εₜ seriellt okorrelerad  →  Ljung-Box, Durbin-Watson
+    #   E(εₜη'ₛ) = 0 ∀ s,t      →  inbyggt i modellstrukturen
+    #   E(εₜα'₀) = 0, E(ηₜα'₀) = 0  →  inbyggt i modellstrukturen
+    if si_valid is not None:
+        metrics["Innov. medel"] = float(np.mean(si_valid))
     try:
         from statsmodels.stats.diagnostic import acorr_ljungbox
-        lb = acorr_ljungbox(resid, lags=[10], return_df=True)
+        lb = acorr_ljungbox(resid_eval, lags=[10], return_df=True)
         metrics["Ljung-Box Q(10)"] = float(lb["lb_stat"].values[0])
         metrics["Ljung-Box p"]     = float(lb["lb_pvalue"].values[0])
     except Exception:
         pass
-
-    # ── 5. Durbin-Watson (autokorreation av ordning 1) ───────────────
     try:
         from statsmodels.stats.stattools import durbin_watson
-        metrics["Durbin-Watson"] = float(durbin_watson(resid))
+        metrics["Durbin-Watson"] = float(durbin_watson(resid_eval))
     except Exception:
         pass
 
-    # ── 6. Prediktionsintervallets täckningsgrad ─────────────────────
-    ci_lower = ci[valid, 0]
-    ci_upper = ci[valid, 1]
-    inside   = (o >= ci_lower) & (o <= ci_upper)
-    metrics["95%-täckning"] = float(inside.mean())
+    # Sammanfattande bedömning: antagande 2
+    a2_ok = True
+    if "Ljung-Box p" in metrics and metrics["Ljung-Box p"] < 0.05:
+        a2_ok = False
+    metrics["A2 uppfyllt"] = a2_ok
 
-    # ── 7. Latenta variabler: genomsnittlig osäkerhet ────────────────
-    #   Detta är SSM-specifikt — visar hur väl modellen identifierar
-    #   de dolda tillstånden.  Lägre = bättre.
-    level_std  = np.sqrt(np.maximum(out["level_var"], 0))
-    season_std = np.sqrt(np.maximum(out["season_var"], 0))
-    metrics["Latent nivå µ — medel-std"]   = float(np.mean(level_std))
-    metrics["Latent säsong γ₀ — medel-std"] = float(np.mean(season_std))
+    # ── Antagande 3 (§17.9): Normalfördelning ───────────────────────
+    #   Kalmanfiltrets härledning kräver normalfördelade feltermer
+    #   och initialtillstånd.  Visuell bedömning via histogram över
+    #   standardiserade innovationer.
+    metrics["_si_valid"] = si_valid   # sparas för histogram (efter burn-in, för mått)
+    # Spara HELA serien (utan burn-in) för ärligare histogram och residualplot
+    try:
+        si_all = si_base[~np.isnan(si_base)]  # alla icke-NaN innovationer
+        metrics["_si_all"] = si_all if len(si_all) > 10 else si_valid
+    except Exception:
+        metrics["_si_all"] = si_valid
 
-    # Genomsnittlig total latent osäkerhet (nivå + säsong)
-    total_std = np.sqrt(np.maximum(out["level_var"] + out["season_var"], 0))
-    metrics["Latent total — medel-std"]    = float(np.mean(total_std))
+    # Spara HELA residualserien (utan burn-in) med tidsindex för residualplot
+    dates_arr = out.get("index")
+    full_resid = obs - pred  # hela serien inkl. NaN
+    full_valid = ~np.isnan(full_resid)
+    metrics["_resid"] = full_resid[full_valid]
+    metrics["_resid_dates"] = dates_arr[full_valid] if dates_arr is not None else None
 
     # ── Skriv ut ─────────────────────────────────────────────────────
     print(f"\n{'='*60}")
     print(f"DIAGNOSTIK: {label}")
     print(f"{'='*60}")
 
-    print("\n── Informationskriterier ──")
-    for k in ["Log-likelihood", "AIC", "BIC", "HQIC", "Antal parametrar", "Antal obs (T)"]:
-        print(f"  {k:<30} = {metrics[k]:>12.4f}" if isinstance(metrics[k], float)
+    print("\n── Modellanpassning ──")
+    for k in ["Log-likelihood", "AIC", "BIC", "HQIC",
+              "Antal parametrar", "Antal obs (T)"]:
+        print(f"  {k:<30} = {metrics[k]:>12.4f}"
+              if isinstance(metrics[k], float)
               else f"  {k:<30} = {metrics[k]:>12d}")
 
     print("\n── Prediktionsfel (basröret, one-step-ahead) ──")
     for k in ["RMSE", "MAE", "ME (bias)"]:
         print(f"  {k:<30} = {metrics[k]:>12.6f}")
-
-    if "Innov. medel" in metrics:
-        print("\n── Standardiserade innovationer (bör vara ≈ N(0,1)) ──")
-        for k in ["Innov. medel", "Innov. std", "Innov. skevhet", "Innov. kurtosis"]:
-            print(f"  {k:<30} = {metrics[k]:>12.4f}")
-
-    if "Ljung-Box Q(10)" in metrics:
-        print("\n── Autokorrelationstest ──")
-        for k in ["Ljung-Box Q(10)", "Ljung-Box p", "Durbin-Watson"]:
-            if k in metrics:
-                print(f"  {k:<30} = {metrics[k]:>12.4f}")
-
-    print("\n── Prediktionsintervall ──")
     print(f"  {'95%-täckning':<30} = {metrics['95%-täckning']:>11.1%}")
 
-    print("\n── Latenta variabler (SSM-specifikt) ──")
-    print("  Dessa variabler observeras aldrig direkt — de skattas av")
-    print("  Kalman-smoothern.  Lägre osäkerhet = bättre identifiering.")
-    for k in ["Latent nivå µ — medel-std", "Latent säsong γ₀ — medel-std",
-              "Latent total — medel-std"]:
-        print(f"  {k:<35} = {metrics[k]:>10.6f} m")
+    # — Antagande 1 —
+    print("\n── Antagande 1 (§17.1): Initialtillstånd ──")
+    print("  Approximate diffuse: a₀=0, P₀=10⁶·I")
+
+    # — Antagande 2 —
+    print("\n── Antagande 2 (§17.1): Okorrelerade feltermer ──")
+    if "Innov. medel" in metrics:
+        print(f"  {'Innov. medelvärde':<30} = {metrics['Innov. medel']:>12.4f}")
+    if "Ljung-Box Q(10)" in metrics:
+        print(f"  {'Ljung-Box Q(10)':<30} = {metrics['Ljung-Box Q(10)']:>12.4f}")
+        print(f"  {'Ljung-Box p-värde':<30} = {metrics['Ljung-Box p']:>12.4f}")
+    if "Durbin-Watson" in metrics:
+        print(f"  {'Durbin-Watson':<30} = {metrics['Durbin-Watson']:>12.4f}")
+
+    # — Antagande 3 — histogram sparas som PNG
+    print("\n── Antagande 3 (§17.9): Normalfördelning ──")
+    si = metrics.get("_si_all", metrics.get("_si_valid"))
+    if si is not None and len(si) > 10:
+        import matplotlib.pyplot as plt
+        slug = label.lower().replace(" ", "_").replace("(", "").replace(")", "")
+        fname = f"residual_histogram_{slug}.png"
+        fig, ax = plt.subplots(figsize=(6, 4))
+        ax.hist(si, bins=20, color="steelblue", edgecolor="white")
+        ax.set_xlabel("Standardiserad innovation")
+        ax.set_ylabel("Frekvens")
+        ax.set_title(f"Histogram över basröret 22W102 - State Space")
+        fig.tight_layout()
+        fig.savefig(fname, dpi=150)
+        plt.close(fig)
+        print(f"  Histogram sparat till: {fname}")
+
+        # Residualer över tid (observation − prediktion)
+        resid_vals  = metrics.get("_resid")
+        resid_dates = metrics.get("_resid_dates")
+        if resid_vals is not None and resid_dates is not None:
+            fname2 = f"residual_tid_{slug}.png"
+            fig2, ax2 = plt.subplots(figsize=(10, 4))
+            ax2.plot(resid_dates, resid_vals,
+                     marker="o", markersize=3, linestyle="-",
+                     color="steelblue", linewidth=0.8)
+            ax2.axhline(0, linestyle="--", color="black", linewidth=0.8)
+            ax2.set_xlabel("Datum")
+            ax2.set_ylabel("Residual (observation \u2212 prediktion)")
+            ax2.set_title(f"Residualer över tid \u2014 {label} State Space")
+            ax2.grid(True, alpha=0.3)
+            fig2.tight_layout()
+            fig2.savefig(fname2, dpi=150)
+            plt.close(fig2)
+            print(f"  Residualplot sparat till: {fname2}")
+    else:
+        print("  Inga innovationer tillgängliga för histogram.")
 
     return metrics
 
@@ -1233,32 +1077,37 @@ if __name__ == "__main__":
     base = load_base_station()
     print(f"Basobjekt 22W102: {len(base)} rader, {base.isna().sum()} saknade värden")
 
+    # Hämta kandidatrör (samma akvifer+jordart) — används av både baslinje och multi
+    print("\n--- Hämtar kandidatrör från SGU API ---")
+    refs = load_candidate_stations(base)
+
     ref = None
     df_base = None
+    baseline_ref_id = None
     if MODE in ("baseline", "both"):
-        print("\n--- Hämtar referensrör 95_2 (baslinje) ---")
-        ref = load_reference_station("95_2")
-        print(f"Referens 95_2: {len(ref)} rader, {ref.isna().sum()} saknade värden")
-        df_base = prepare_joint_dataframe_baseline(base, ref, freq="7D")
+        # Välj topp 1 via Pearson-korrelation (samma metod som multi)
+        df_top1 = prepare_joint_dataframe_multi(base, refs, freq="7D", max_refs=1)
+        baseline_ref_id = [c for c in df_top1.columns if c != "base"][0]
+        ref = df_top1[baseline_ref_id]
+        # Bygg enkel baseline-dataframe med kolumnerna "base" och "ref"
+        df_base = df_top1.rename(columns={baseline_ref_id: "ref"})[["base", "ref"]]
+        print(f"\nBaslinjens referensrör: {baseline_ref_id} (högst |r| med basröret)")
 
-    refs = None
     df_multi = None
     if MODE in ("multi", "both"):
-        print("\n--- Hämtar kandidatrör från SGU API (multivariat) ---")
-        refs = load_candidate_stations(base)
-        df_multi = prepare_joint_dataframe_multi(base, refs, freq="7D", max_refs=4)
+        df_multi = prepare_joint_dataframe_multi(base, refs, freq="7D", max_refs=5)
 
     print("\n✓ All data hämtad — startar modellanpassning\n")
 
     # Initiera resultatvariabler
-    result_base = result_multi = result_tvp = None
-    out_base = out_multi = out_tvp = None
-    metrics_base = metrics_multi = metrics_tvp = None
+    result_base = result_multi = None
+    out_base = out_multi = None
+    metrics_base = metrics_multi = None
 
     # ── STEG 2: BASLINJEMODELL ────────────────────────────────────────────
     if MODE in ("baseline", "both"):
         print("="*60)
-        print("BASLINJEMODELL — ett referensrör (95_2)")
+        print(f"BASLINJEMODELL — ett referensrör ({baseline_ref_id})")
         print("="*60)
         print(f"\nGemensamt dataset: {len(df_base)} veckor "
               f"({df_base.index[0].date()} – {df_base.index[-1].date()})")
@@ -1289,7 +1138,7 @@ if __name__ == "__main__":
         # Plotta och spara
         try:
             print("\n=== Genererar plot (baslinje) ===")
-            fig_base = plot_results(out_base, anomaly_base, ref_label="95_2")
+            fig_base = plot_results(out_base, anomaly_base, ref_label=baseline_ref_id)
             fig_base.savefig("groundwater_ssm_baseline.png", dpi=150, bbox_inches="tight")
             print("Plot sparad till: groundwater_ssm_baseline.png")
             plt.close(fig_base)
@@ -1368,90 +1217,17 @@ if __name__ == "__main__":
             print(f"  {k:<40} = {v:.6f}")
 
 
-    # ── STEG 4: TVP-MODELL (tidsvarierande β) ────────────────────────────
-    if MODE in ("tvp", "both"):
-        print("\n" + "="*60)
-        print("TVP-MODELL — tidsvarierande β (Durbin & Koopman 2012)")
-        print("="*60)
-
-        # Använd samma data som multivariatmodellen
-        if df_multi is None:
-            print("--- Hämtar kandidatrör från SGU API (TVP) ---")
-            refs = load_candidate_stations(base)
-            df_multi = prepare_joint_dataframe_multi(base, refs, freq="7D", max_refs=4)
-
-        ref_ids_tvp = [col for col in df_multi.columns if col != "base"]
-        print(f"\nAnvänder {len(ref_ids_tvp)} referensrör: {ref_ids_tvp}")
-        print(f"Gemensamt dataset: {len(df_multi)} veckor "
-              f"({df_multi.index[0].date()} – {df_multi.index[-1].date()})")
-
-        # Anpassa TVP-modellen
-        print("\n=== Anpassar TVP-modell ===")
-        result_tvp, model_tvp = fit_model_tvp(df_multi, nseason=26)
-
-        # Kör Kalman smoother + prognos
-        print("\n=== Kör Kalman smoother + prognos (TVP) ===")
-        out_tvp = smooth_and_forecast(result_tvp, df_multi, n_forecast=26)
-
-        # Imputation
-        imputed_tvp = imputation_report(df_multi, out_tvp)
-
-        # Avvikelsedetektering
-        anomaly_tvp = detect_anomalies(
-            observed=out_tvp["observed_base"],
-            pred_ci=out_tvp["pred_ci"],
-            min_consecutive=3,
-        )
-        n_anom = anomaly_tvp.sum()
-        print(f"\nAvvikelsedetektering (TVP): {n_anom} tidpunkter flaggade "
-              f"({n_anom/len(anomaly_tvp)*100:.1f}%)")
-
-        # Plotta och spara
-        try:
-            print("\n=== Genererar plot (TVP) ===")
-            fig_tvp = plot_results(out_tvp, anomaly_tvp,
-                                    ref_label=", ".join(ref_ids_tvp) + " (TVP)")
-            fig_tvp.savefig("groundwater_ssm_tvp.png", dpi=150, bbox_inches="tight")
-            print("Plot sparad till: groundwater_ssm_tvp.png")
-            plt.close(fig_tvp)
-        except (Exception, KeyboardInterrupt) as e:
-            print(f"⚠ Plottning (TVP) misslyckades: {type(e).__name__}: {e}")
-            plt.close("all")
-
-        # Spara imputerade värden
-        if not imputed_tvp.empty:
-            imputed_tvp.to_csv("imputed_values_tvp.csv")
-            print("Imputerade värden sparade till: imputed_values_tvp.csv")
-
-        # Skattade parametrar
-        print("\n=== Skattade parametrar (TVP) ===")
-        params_tvp = dict(zip(model_tvp.param_names, result_tvp.params))
-        for k, v in params_tvp.items():
-            print(f"  {k:<40} = {v:.6f}")
-
-        # Tidsvarierande β — skriv ut start, slut och standardavvikelse
-        ns = model_tvp.nseason
-        print("\n=== Tidsvarierande β_i(t) — start, slut, std ===")
-        for i, rid in enumerate(ref_ids_tvp):
-            beta_t = result_tvp.smoother_results.smoothed_state[1 + ns + i]
-            print(f"  β_{rid}(t): start={beta_t[0]:.4f}, "
-                  f"slut={beta_t[-1]:.4f}, std={np.std(beta_t):.4f}")
-
-
     # ── UTVÄRDERING & JÄMFÖRELSE ──────────────────────────────────────
     if MODE in ("baseline", "both") and result_base is not None:
         metrics_base = evaluate_model(result_base, out_base,
-                                      label="Baslinje (95_2)")
+                                      label="Baslinje")
     if MODE in ("multi", "both") and result_multi is not None:
         metrics_multi = evaluate_model(result_multi, out_multi,
                                        label="Multivariat")
-    if MODE in ("tvp", "both") and result_tvp is not None:
-        metrics_tvp = evaluate_model(result_tvp, out_tvp,
-                                     label="TVP (tidsvar. β)")
 
     if MODE == "both":
         print("\n" + "="*60)
-        print("JÄMFÖRELSE: Baslinje vs Multivariat vs TVP")
+        print("JÄMFÖRELSE: Baslinje vs Multivariat")
         print("="*60)
 
         # Samla alla modeller som körts
@@ -1461,11 +1237,9 @@ if __name__ == "__main__":
             all_metrics.append(metrics_base); labels.append("Baslinje")
         if metrics_multi is not None:
             all_metrics.append(metrics_multi); labels.append("Multi")
-        if metrics_tvp is not None:
-            all_metrics.append(metrics_tvp); labels.append("TVP")
 
         comparison_keys = [
-            ("── Informationskriterier ──", None),
+            ("── Modellanpassning ──", None),
             ("Log-likelihood", "{:>12.2f}"),
             ("AIC", "{:>12.2f}"),
             ("BIC", "{:>12.2f}"),
@@ -1475,21 +1249,12 @@ if __name__ == "__main__":
             ("RMSE", "{:>12.6f}"),
             ("MAE", "{:>12.6f}"),
             ("ME (bias)", "{:>12.6f}"),
-            ("── Innovationer ──", None),
+            ("95%-täckning", "{:>11.1%}"),
+            ("── Antagande 2: Okorrelerade feltermer ──", None),
             ("Innov. medel", "{:>12.4f}"),
-            ("Innov. std", "{:>12.4f}"),
-            ("Innov. skevhet", "{:>12.4f}"),
-            ("Innov. kurtosis", "{:>12.4f}"),
-            ("── Autokorrelation ──", None),
             ("Ljung-Box Q(10)", "{:>12.4f}"),
             ("Ljung-Box p", "{:>12.4f}"),
             ("Durbin-Watson", "{:>12.4f}"),
-            ("── PI-täckning ──", None),
-            ("95%-täckning", "{:>11.1%}"),
-            ("── Latenta variabler ──", None),
-            ("Latent nivå µ — medel-std", "{:>12.6f}"),
-            ("Latent säsong γ₀ — medel-std", "{:>12.6f}"),
-            ("Latent total — medel-std", "{:>12.6f}"),
         ]
 
         # Dynamisk header för valfritt antal modeller
@@ -1501,15 +1266,11 @@ if __name__ == "__main__":
         print(f"  {'-'*(35 + 15*len(labels) + 6)}")
 
         lower_is_better  = {"AIC", "BIC", "HQIC", "RMSE", "MAE",
-                            "Ljung-Box Q(10)",
-                            "Latent nivå µ — medel-std",
-                            "Latent säsong γ₀ — medel-std",
-                            "Latent total — medel-std"}
+                            "Ljung-Box Q(10)"}
         higher_is_better = {"Log-likelihood", "95%-täckning",
                             "Ljung-Box p"}
         target_value     = {"ME (bias)": 0.0, "Innov. medel": 0.0,
-                            "Innov. std": 1.0, "Innov. skevhet": 0.0,
-                            "Innov. kurtosis": 0.0, "Durbin-Watson": 2.0}
+                            "Durbin-Watson": 2.0}
 
         for key, fmt in comparison_keys:
             if fmt is None:
