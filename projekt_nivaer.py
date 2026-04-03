@@ -373,19 +373,14 @@ class GroundwaterSSM(MLEModel):
 #sigma2 epsilon (sigma2 eps) skattar mätfelet för referensröret
 #sigma2_eps_base är låst till 0 (basrörets mätningar antas vara exakta)
 #trend-komponenten är borttagen: µ(t+1) = µ(t) + η_level(t)
-    param_names = [
-        "sigma2_eta_level",   # process noise: nivå
-        "sigma2_eta_season",  # process noise: säsong
-        "sigma2_eps_ref",     # obs noise: referensobjekt
-        "beta_ref",           # koppling nivå → referens
-    ]
+    # param_names sätts dynamiskt i __init__ beroende på nseason
 
     def __init__(self, endog, nseason=26, **kwargs):
         self.nseason = nseason
         #nedan beräknas antalet states med 26 st säsonger blir det 26+1(nivå) = 27 states
-        k_states = 1 + nseason
-        # Bara 2 chockkällor (nivå + säsong) — resten av states är deterministiska skift
-        k_posdef = 2
+        # Om nseason=0 → ingen säsongskomponent, bara nivå (local level)
+        k_states = 1 + nseason if nseason > 0 else 1
+        k_posdef = 2 if nseason > 0 else 1
 
         super().__init__(
             endog,
@@ -394,105 +389,134 @@ class GroundwaterSSM(MLEModel):
             **kwargs,
         )
 
+        # Dynamiska parameternamn
+        if nseason > 0:
+            self._param_names = [
+                "sigma2_eta_level", "sigma2_eta_season",
+                "sigma2_eps_ref", "beta_ref",
+            ]
+        else:
+            self._param_names = [
+                "sigma2_eta_level",
+                "sigma2_eps_ref", "beta_ref",
+            ]
+
         # Diffus initiering för nivå (okänt startvärde)
         self.ssm.initialize_approximate_diffuse()
+
+    @property
+    def param_names(self):
+        return self._param_names
 
     @property
     def start_params(self):
         import statsmodels.api as sm
 
-        y1 = self.endog[:, 0]  # basröret 22W102
-        y2 = self.endog[:, 1]  # referensröret 95_2
+        y1 = self.endog[:, 0]  # basröret
+        y2 = self.endog[:, 1]  # referensröret
 
         # Steg 1-3: Anpassa univariat strukturmodell till basröret
         # Detta ger oss databaserade startgissningar för varianser och säsong
-        mod = sm.tsa.UnobservedComponents(
-            y1, level="local level", seasonal=self.nseason
-        )
-        res = mod.fit(disp=False, method="nm", maxiter=500)
-
-        sigma2_eta_level  = float(res.params[1])  # process noise nivå
-        sigma2_eta_season = float(res.params[2])  # process noise säsong
+        if self.nseason > 0:
+            mod = sm.tsa.UnobservedComponents(
+                y1, level="local level", seasonal=self.nseason
+            )
+            res = mod.fit(disp=False, method="nm", maxiter=500)
+            sigma2_eta_level  = float(res.params[1])
+            sigma2_eta_season = float(res.params[2])
+            level  = res.level.smoothed
+            season = res.seasonal.smoothed
+        else:
+            # Ingen säsong — enbart local level
+            mod = sm.tsa.UnobservedComponents(y1, level="local level")
+            res = mod.fit(disp=False, method="nm", maxiter=500)
+            sigma2_eta_level = float(res.params[1])
+            level  = res.level.smoothed
+            season = np.zeros_like(level)
 
         # Steg 5: OLS för laddningsparameter beta_ref
-        level     = res.level.smoothed
-        season    = res.seasonal.smoothed
         y2_deseas = y2 - season
-
-        # mask använder level (samma längd som y2_deseas)
         mask = ~(np.isnan(y2_deseas) | np.isnan(level))
         X    = level[mask].reshape(-1, 1)
         ols  = np.linalg.lstsq(X, y2_deseas[mask], rcond=None)
         beta_ref       = float(ols[0][0])
         sigma2_eps_ref = float(np.var(y2_deseas[mask] - X.flatten() * beta_ref))
 
-        return np.array([
-            sigma2_eta_level,    # process noise: nivå
-            sigma2_eta_season,   # process noise: säsong
-            sigma2_eps_ref,      # obs noise: referensröret
-            beta_ref,            # koppling nivå → referens
-        ])
+        if self.nseason > 0:
+            return np.array([
+                sigma2_eta_level, sigma2_eta_season,
+                sigma2_eps_ref, beta_ref,
+            ])
+        else:
+            return np.array([
+                sigma2_eta_level,
+                sigma2_eps_ref, beta_ref,
+            ])
 
 #FORTSÄTT FÖRKLARA DENNA KOD FRÅN OCH MED IMORGON 
 
     def transform_params(self, unconstrained):
         p = unconstrained.copy()
         # Varianser: exp-transform → alltid positiva
-        p[:3] = np.exp(unconstrained[:3])
+        n_var = 3 if self.nseason > 0 else 2  # level+season+ref vs level+ref
+        p[:n_var] = np.exp(unconstrained[:n_var])
         return p
 
     def untransform_params(self, constrained):
         p = constrained.copy()
-        p[:3] = np.log(constrained[:3])
+        n_var = 3 if self.nseason > 0 else 2
+        p[:n_var] = np.log(constrained[:n_var])
         return p
 
     def update(self, params, **kwargs):
         params = super().update(params, **kwargs)
 
-        (s2_level, s2_season,
-         s2_ref, beta_ref) = params
-
         ns = self.nseason
         k  = self.k_states
 
+        if ns > 0:
+            (s2_level, s2_season, s2_ref, beta_ref) = params
+        else:
+            (s2_level, s2_ref, beta_ref) = params
+
         # ── Transitionsmatris T ──────────────────────────────────────────
         T = np.zeros((k, k))
+        T[0, 0] = 1.0  # Nivå: µ(t+1) = µ(t)  (random walk utan trend)
 
-        # Nivå: µ(t+1) = µ(t)  (random walk utan trend)
-        T[0, 0] = 1.0
-
-        # Säsong med summavillkor:
-        #   γ_0(t+1) = -γ_0(t) - γ_1(t) - ... - γ_{s-2}(t)
-        #   γ_j(t+1) = γ_{j-1}(t)  för j=1..s-1
-        T[1, 1:1+ns] = -1.0
-        for j in range(1, ns):
-            T[1 + j, 1 + j - 1] = 1.0
+        if ns > 0:
+            # Säsong med summavillkor:
+            T[1, 1:1+ns] = -1.0
+            for j in range(1, ns):
+                T[1 + j, 1 + j - 1] = 1.0
 
         self.ssm["transition"] = T
 
         # ── Observationsmatris Z ─────────────────────────────────────────
-        # y_base = µ + γ_0          (direkt nivå + säsong)
-        # y_ref  = beta*µ            (referens kopplad via nivå)
         Z = np.zeros((2, k))
         Z[0, 0] = 1.0      # base ← nivå
-        Z[0, 1] = 1.0      # base ← säsong
-        Z[1, 0] = beta_ref # ref  ← nivå
+        if ns > 0:
+            Z[0, 1] = 1.0  # base ← säsong
+        Z[1, 0] = beta_ref  # ref  ← nivå
 
         self.ssm["design"] = Z
 
         # ── Observationsbrus ────────────────────────────────────────────
-        # sigma2_eps_base är låst till 0: basrörets mätningar antas exakta
         self.ssm["obs_cov"] = np.diag([0.0, s2_ref])
 
-        # ── Processkörsbrus Q (2×2) ─────────────────────────────────────
-        Q = np.array([[s2_level, 0.0],
-                      [0.0, s2_season]])
+        # ── Processkörsbrus Q ───────────────────────────────────────────
+        if ns > 0:
+            Q = np.array([[s2_level, 0.0],
+                          [0.0, s2_season]])
+        else:
+            Q = np.array([[s2_level]])
         self.ssm["state_cov"] = Q
 
-        # ── Selektionsmatris R (k×2): kopplar chockerna till rätt state ─
-        R = np.zeros((k, 2))
+        # ── Selektionsmatris R: kopplar chockerna till rätt state ───────
+        kp = 2 if ns > 0 else 1
+        R = np.zeros((k, kp))
         R[0, 0] = 1.0  # η_level  → state 0 (nivå)
-        R[1, 1] = 1.0  # η_season → state 1 (γ_0)
+        if ns > 0:
+            R[1, 1] = 1.0  # η_season → state 1 (γ_0)
         self.ssm["selection"] = R
 
 
@@ -515,10 +539,9 @@ class GroundwaterSSM_Multi(MLEModel):
         self.ref_ids = ref_ids if ref_ids is not None else []
         self.n_refs  = len(self.ref_ids)
 
-        #nedan beräknas antalet states med 26 st säsonger blir det 26+1(nivå) = 27 states
-        k_states = 1 + nseason
-        # Bara 2 chockkällor (nivå + säsong) — resten av states är deterministiska skift
-        k_posdef = 2
+        # Om nseason=0 → ingen säsongskomponent, bara nivå
+        k_states = 1 + nseason if nseason > 0 else 1
+        k_posdef = 2 if nseason > 0 else 1
 
         super().__init__(
             endog,
@@ -527,12 +550,18 @@ class GroundwaterSSM_Multi(MLEModel):
             **kwargs,
         )
 
-        # param_names sätts dynamiskt: 2 process noise + 4 parametrar per referensrör
-        # sparas som _param_names eftersom MLEModel redan har param_names som property
-        self._param_names = ["sigma2_eta_level", "sigma2_eta_season"]
-        for rid in self.ref_ids:
-            self._param_names += [f"sigma2_eps_{rid}", f"beta_{rid}",
-                                  f"alpha_{rid}", f"gamma_{rid}"]
+        # param_names: med säsong: 2 processvarianser + 4 per ref
+        #              utan säsong: 1 processvarians + 3 per ref (ingen gamma)
+        if nseason > 0:
+            self._param_names = ["sigma2_eta_level", "sigma2_eta_season"]
+            for rid in self.ref_ids:
+                self._param_names += [f"sigma2_eps_{rid}", f"beta_{rid}",
+                                      f"alpha_{rid}", f"gamma_{rid}"]
+        else:
+            self._param_names = ["sigma2_eta_level"]
+            for rid in self.ref_ids:
+                self._param_names += [f"sigma2_eps_{rid}", f"beta_{rid}",
+                                      f"alpha_{rid}"]
 
         # Diffus initiering för nivå (okänt startvärde)
         self.ssm.initialize_approximate_diffuse()
@@ -550,7 +579,7 @@ class GroundwaterSSM_Multi(MLEModel):
         # Steg 1-2: Anpassa univariat strukturmodell till basröret för startgissningar.
         # Om basen saknar tillräckligt med observationer används enkla standardvärden.
         y1_valid = y1[~np.isnan(y1)]
-        if len(y1_valid) >= 3:
+        if len(y1_valid) >= 3 and self.nseason > 0:
             mod = sm.tsa.UnobservedComponents(
                 y1, level="local level", seasonal=self.nseason
             )
@@ -559,28 +588,45 @@ class GroundwaterSSM_Multi(MLEModel):
             sigma2_eta_season = float(res.params[2])
             level  = res.level.smoothed
             season = res.seasonal.smoothed
+        elif len(y1_valid) >= 3:
+            # Ingen säsong — enbart local level
+            mod = sm.tsa.UnobservedComponents(y1, level="local level")
+            res = mod.fit(disp=False, method="nm", maxiter=500)
+            sigma2_eta_level = float(res.params[1])
+            level  = res.level.smoothed
+            season = np.zeros(len(y1))
         else:
             # Basen är helt tom — använd referensrör 1 som proxy för startvärden
             y_proxy = self.endog[:, 1]
             y_proxy_valid = y_proxy[~np.isnan(y_proxy)]
             sigma2_eta_level  = float(np.var(y_proxy_valid)) * 0.01 if len(y_proxy_valid) > 1 else 0.01
-            sigma2_eta_season = sigma2_eta_level * 0.1
             level  = np.full(len(y1), float(np.nanmean(y_proxy_valid)) if len(y_proxy_valid) > 0 else 0.0)
             season = np.zeros(len(y1))
 
-        params = [sigma2_eta_level, sigma2_eta_season]
+        if self.nseason > 0:
+            params = [sigma2_eta_level, sigma2_eta_season]
+        else:
+            params = [sigma2_eta_level]
 
-        # Steg 3: OLS för varje referensrör: y_ref = alpha + beta*level + gamma*season
+        # Steg 3: OLS per referensrör
         for i in range(self.n_refs):
             y_ref = self.endog[:, 1 + i]
             mask  = ~(np.isnan(y_ref) | np.isnan(level) | np.isnan(season))
-            X     = np.column_stack([np.ones(mask.sum()), level[mask], season[mask]])
-            ols   = np.linalg.lstsq(X, y_ref[mask], rcond=None)
-            alpha_i  = float(ols[0][0])
-            beta_i   = float(ols[0][1])
-            gamma_i  = float(ols[0][2])
-            s2_eps_i = float(np.var(y_ref[mask] - X @ ols[0]))
-            params  += [max(s2_eps_i, 1e-6), beta_i, alpha_i, gamma_i]
+            if self.nseason > 0:
+                X     = np.column_stack([np.ones(mask.sum()), level[mask], season[mask]])
+                ols   = np.linalg.lstsq(X, y_ref[mask], rcond=None)
+                alpha_i  = float(ols[0][0])
+                beta_i   = float(ols[0][1])
+                gamma_i  = float(ols[0][2])
+                s2_eps_i = float(np.var(y_ref[mask] - X @ ols[0]))
+                params  += [max(s2_eps_i, 1e-6), beta_i, alpha_i, gamma_i]
+            else:
+                X     = np.column_stack([np.ones(mask.sum()), level[mask]])
+                ols   = np.linalg.lstsq(X, y_ref[mask], rcond=None)
+                alpha_i  = float(ols[0][0])
+                beta_i   = float(ols[0][1])
+                s2_eps_i = float(np.var(y_ref[mask] - X @ ols[0]))
+                params  += [max(s2_eps_i, 1e-6), beta_i, alpha_i]
 
         return np.array(params)
 
@@ -588,87 +634,105 @@ class GroundwaterSSM_Multi(MLEModel):
 
     def transform_params(self, unconstrained):
         p = unconstrained.copy()
-        # Varianser: exp-transform → alltid positiva
         p[0] = np.exp(unconstrained[0])   # sigma2_eta_level
-        p[1] = np.exp(unconstrained[1])   # sigma2_eta_season
+        if self.nseason > 0:
+            p[1] = np.exp(unconstrained[1])   # sigma2_eta_season
+            ppref = 4  # params per ref: eps, beta, alpha, gamma
+            offset = 2
+        else:
+            ppref = 3  # params per ref: eps, beta, alpha
+            offset = 1
         for i in range(self.n_refs):
-            p[2 + 4*i] = np.exp(unconstrained[2 + 4*i])  # sigma2_eps_ref_i
-            # beta, alpha, gamma (index 3+4i, 4+4i, 5+4i) obegränsade
+            p[offset + ppref*i] = np.exp(unconstrained[offset + ppref*i])
         return p
 
     def untransform_params(self, constrained):
         p = constrained.copy()
         p[0] = np.log(constrained[0])
-        p[1] = np.log(constrained[1])
+        if self.nseason > 0:
+            p[1] = np.log(constrained[1])
+            ppref = 4
+            offset = 2
+        else:
+            ppref = 3
+            offset = 1
         for i in range(self.n_refs):
-            p[2 + 4*i] = np.log(constrained[2 + 4*i])
+            p[offset + ppref*i] = np.log(constrained[offset + ppref*i])
         return p
 
     def update(self, params, **kwargs):
         params = super().update(params, **kwargs)
 
-        s2_level  = params[0]
-        s2_season = params[1]
-        # Plocka ut (sigma2_eps_i, beta_i, alpha_i, gamma_i) för varje referensrör
-        ref_params = [
-            (params[2 + 4*i], params[3 + 4*i], params[4 + 4*i], params[5 + 4*i])
-            for i in range(self.n_refs)
-        ]
-
         ns      = self.nseason
         k       = self.k_states
         n_endog = 1 + self.n_refs
 
+        s2_level = params[0]
+        if ns > 0:
+            s2_season = params[1]
+            ppref = 4; offset = 2
+            ref_params = [
+                (params[offset + ppref*i], params[offset + ppref*i+1],
+                 params[offset + ppref*i+2], params[offset + ppref*i+3])
+                for i in range(self.n_refs)
+            ]
+        else:
+            ppref = 3; offset = 1
+            ref_params = [
+                (params[offset + ppref*i], params[offset + ppref*i+1],
+                 params[offset + ppref*i+2], 0.0)
+                for i in range(self.n_refs)
+            ]
+
         # ── Transitionsmatris T ──────────────────────────────────────────
         T = np.zeros((k, k))
+        T[0, 0] = 1.0  # Nivå: µ(t+1) = µ(t)
 
-        # Nivå: µ(t+1) = µ(t)  (random walk utan trend)
-        T[0, 0] = 1.0
-
-        # Säsong med summavillkor:
-        #   γ_0(t+1) = -γ_0(t) - γ_1(t) - ... - γ_{s-2}(t)
-        #   γ_j(t+1) = γ_{j-1}(t)  för j=1..s-1
-        T[1, 1:1+ns] = -1.0
-        for j in range(1, ns):
-            T[1 + j, 1 + j - 1] = 1.0
+        if ns > 0:
+            T[1, 1:1+ns] = -1.0
+            for j in range(1, ns):
+                T[1 + j, 1 + j - 1] = 1.0
 
         self.ssm["transition"] = T
 
         # ── Observationsmatris Z ─────────────────────────────────────────
-        # y_base  = µ + γ_0                              (direkt nivå + säsong)
-        # y_ref_i = alpha_i + beta_i*µ + gamma_i*γ_0     (intercept + nivå + säsong)
         Z = np.zeros((n_endog, k))
         Z[0, 0] = 1.0   # base ← nivå
-        Z[0, 1] = 1.0   # base ← säsong
+        if ns > 0:
+            Z[0, 1] = 1.0   # base ← säsong
         for i, (_, beta_i, _, gamma_i) in enumerate(ref_params):
-            Z[1 + i, 0] = beta_i   # ref_i ← beta_i * nivå
-            Z[1 + i, 1] = gamma_i  # ref_i ← gamma_i * säsong
+            Z[1 + i, 0] = beta_i
+            if ns > 0:
+                Z[1 + i, 1] = gamma_i
 
         self.ssm["design"] = Z
 
         # ── Observationsintercept (d-vektor) ─────────────────────────────
-        # alpha_i fångar skillnad i absolut nivå mellan referensrör och basrör
         d = np.zeros((n_endog, 1))
         for i, (_, _, alpha_i, _) in enumerate(ref_params):
             d[1 + i, 0] = alpha_i
         self.ssm["obs_intercept"] = d
 
         # ── Observationsbrus ────────────────────────────────────────────
-        # sigma2_eps_base är låst till 0: basrörets mätningar antas exakta
         obs_cov = np.zeros((n_endog, n_endog))
         for i, (s2_eps_i, _, _, _) in enumerate(ref_params):
             obs_cov[1 + i, 1 + i] = s2_eps_i
         self.ssm["obs_cov"] = obs_cov
 
-        # ── Processkörsbrus Q (2×2) ─────────────────────────────────────
-        Q = np.array([[s2_level, 0.0],
-                      [0.0, s2_season]])
+        # ── Processkörsbrus Q ───────────────────────────────────────────
+        if ns > 0:
+            Q = np.array([[s2_level, 0.0],
+                          [0.0, s2_season]])
+        else:
+            Q = np.array([[s2_level]])
         self.ssm["state_cov"] = Q
 
-        # ── Selektionsmatris R (k×2): kopplar chockerna till rätt state ─
-        R = np.zeros((k, 2))
+        # ── Selektionsmatris R: kopplar chockerna till rätt state ───────
+        kp = 2 if ns > 0 else 1
+        R = np.zeros((k, kp))
         R[0, 0] = 1.0  # η_level  → state 0 (nivå)
-        R[1, 1] = 1.0  # η_season → state 1 (γ_0)
+        if ns > 0:
+            R[1, 1] = 1.0  # η_season → state 1 (γ_0)
         self.ssm["selection"] = R
 
 # ─────────────────────────────────────────────
@@ -733,10 +797,16 @@ def smooth_and_forecast(result, df: pd.DataFrame, n_forecast: int = 26) -> dict:
     level_var      = smoothed.smoothed_state_cov[0, 0]
 
     # Smoother-baserat prediktionsintervall (undviker explosioner vid saknade värden)
-    season_var = smoothed.smoothed_state_cov[1, 1]
-    total_var  = level_var + season_var
-    std        = np.sqrt(np.maximum(total_var, 0))
-    pred_mean  = level_smoothed + smoothed.smoothed_state[1]
+    nseason = getattr(result.model, 'nseason', 26)
+    if nseason > 0:
+        season_var = smoothed.smoothed_state_cov[1, 1]
+        total_var  = level_var + season_var
+        pred_mean  = level_smoothed + smoothed.smoothed_state[1]
+    else:
+        season_var = np.zeros_like(level_var)
+        total_var  = level_var
+        pred_mean  = level_smoothed
+    std = np.sqrt(np.maximum(total_var, 0))
     pred_ci    = np.column_stack([
         pred_mean - 1.96 * std,
         pred_mean + 1.96 * std,
@@ -753,10 +823,17 @@ def smooth_and_forecast(result, df: pd.DataFrame, n_forecast: int = 26) -> dict:
     ])
 
     last_date = df.index[-1]
+    # Härleda frekvens från indexet
+    inferred_freq = pd.infer_freq(df.index)
+    if inferred_freq is None:
+        # Fallback: beräkna median-avstånd
+        diffs = df.index.to_series().diff().dropna()
+        median_gap = diffs.median()
+        inferred_freq = "MS" if median_gap > pd.Timedelta("21D") else "7D"
     fcast_idx = pd.date_range(
-        last_date + pd.Timedelta("7D"),
+        last_date + (pd.DateOffset(months=1) if "M" in str(inferred_freq) else pd.Timedelta("7D")),
         periods=n_forecast,
-        freq="7D",
+        freq=inferred_freq,
     )
 
     # One-step-ahead filter-prediktioner (basröret, rad 0)
@@ -1049,7 +1126,8 @@ def plot_results(out: dict, anomaly: pd.Series, title_base: str = "22W102",
     idx      = out["index"]
     obs      = out["observed_base"]
     pred     = out["pred_base"].flatten()[:len(idx)]
-    ci       = out["pred_ci"]
+    # Använd filter-CI (one-step-ahead) för visuellt band — synligt över hela serien
+    ci       = out["filter_pred_ci"][:len(idx)]
     f_idx    = out["fcast_index"]
     f_vals   = out["fcast_base"].flatten()[:len(f_idx)]
     f_ci     = out["fcast_ci"][:len(f_idx)]
@@ -1076,7 +1154,7 @@ def plot_results(out: dict, anomaly: pd.Series, title_base: str = "22W102",
     # Prognos
     ax.fill_between(f_idx, f_ci[:, 0], f_ci[:, 1], color="green", alpha=0.15)
     ax.plot(f_idx, f_vals, color="green", lw=2, linestyle="-.",
-            label=f"Prognos ({len(f_idx)} veckor)")
+            label=f"Prognos ({len(f_idx)} steg)")
 
     ax.axvline(idx[-1], color="gray", linestyle=":", alpha=0.6, label="Prognosstart")
     ax.set_ylabel("Nivå (m ö.h.)")
@@ -1128,9 +1206,10 @@ def plot_akvifar_style(out: dict, anomaly: pd.Series,
     obs  = out["observed_base"]
     # Smoother-prediktioner för det visuella (stabilt, ingen diffus-spike)
     pred = out["pred_base"].flatten()[:len(idx)]
-    ci   = out["pred_ci"][:len(idx)]
-    # Filter-CI (one-step-ahead) för att detektera röda punkter — tätare band
-    filter_ci = out["filter_pred_ci"][:len(idx)]
+    # Använd filter-CI (one-step-ahead) för visuellt band — synligt över hela serien
+    ci   = out["filter_pred_ci"][:len(idx)]
+    # Samma CI används även för röda punkter (obs utanför intervallet)
+    filter_ci = ci
 
     fig, ax = plt.subplots(figsize=(12, 6))
 
@@ -1286,6 +1365,22 @@ if __name__ == "__main__":
         base = load_base_station(station_path)
         print(f"Basobjekt {station_id}: {len(base)} rader, {base.isna().sum()} saknade värden")
 
+        # Välj tidsfrekvens automatiskt baserat på datadensitet.
+        # Glesa stationer (typ månadsvis) → "MS" (månad)
+        # Täta stationer (typ veckovis)   → "7D"  (vecka)
+        # Säsongskomponent (nseason) sätts alltid till 0 — sigma2_eta_season
+        # kollapsar till ≈0 för alla stationer, dvs. säsongen bidrar inte.
+        span_days = (base.index.max() - base.index.min()).days
+        n_obs     = base.notna().sum()
+        avg_gap   = span_days / max(n_obs - 1, 1)   # medel antal dagar mellan obs
+        nseason   = 0  # ingen säsongskomponent — verifierat via AIC/BIC för alla stationer
+        if avg_gap > 21:          # glesare än var tredje vecka → månadsfrekvens
+            freq = "MS"
+            print(f"  Gles data (snitt {avg_gap:.0f} dagar mellan obs) → månadsfrekvens, nseason={nseason}")
+        else:
+            freq = "7D"
+            print(f"  Tät data (snitt {avg_gap:.0f} dagar mellan obs) → veckofrekvens, nseason={nseason}")
+
         # Hämta kandidatrör (samma akvifer+jordart) — används av både baslinje och multi
         print("\n--- Hämtar kandidatrör från SGU API ---")
         refs = load_candidate_stations(base, base_station_id=station_id, ignore_geology=False)
@@ -1295,7 +1390,7 @@ if __name__ == "__main__":
         baseline_ref_id = None
         if MODE in ("baseline", "both"):
             # Välj topp 1 via Pearson-korrelation (samma metod som multi)
-            df_top1 = prepare_joint_dataframe_multi(base, refs, freq="7D", max_refs=1)
+            df_top1 = prepare_joint_dataframe_multi(base, refs, freq=freq, max_refs=1)
             baseline_ref_id = [c for c in df_top1.columns if c != "base"][0]
             ref = df_top1[baseline_ref_id]
             # Bygg enkel baseline-dataframe med kolumnerna "base" och "ref"
@@ -1312,7 +1407,7 @@ if __name__ == "__main__":
 
         df_multi = None
         if MODE in ("multi", "both"):
-            df_multi = prepare_joint_dataframe_multi(base, refs, freq="7D", max_refs=5)
+            df_multi = prepare_joint_dataframe_multi(base, refs, freq=freq, max_refs=5)
 
         print("\n✓ All data hämtad — startar modellanpassning\n")
 
@@ -1326,18 +1421,20 @@ if __name__ == "__main__":
             print("="*60)
             print(f"BASLINJEMODELL — ett referensrör ({baseline_ref_id})")
             print("="*60)
-            print(f"\nGemensamt dataset: {len(df_base)} veckor "
+            tidstyp = "månader" if freq == "MS" else "veckor"
+            print(f"\nGemensamt dataset: {len(df_base)} {tidstyp} "
                   f"({df_base.index[0].date()} – {df_base.index[-1].date()})")
             print(f"Saknade i base: {df_base['base'].isna().sum()}")
             print(f"Saknade i ref:  {df_base['ref'].isna().sum()}")
 
             # Anpassa modellen
             print("\n=== Anpassar baslinjemodellen ===")
-            result_base, model_base = fit_model_baseline(df_base, nseason=26)
+            result_base, model_base = fit_model_baseline(df_base, nseason=nseason)
 
-            # Kör Kalman smoother + prognos (26 veckor = ~6 månader)
+            # Kör Kalman smoother + prognos
+            # nseason steg framåt ≈ halv cykel (26 veckor eller 12 månader)
             print("\n=== Kör Kalman smoother + prognos (baslinje) ===")
-            out_base = smooth_and_forecast(result_base, df_base, n_forecast=26)
+            out_base = smooth_and_forecast(result_base, df_base, n_forecast=nseason)
 
             # Imputation-rapport
             imputed_base = imputation_report(df_base, out_base)
@@ -1403,7 +1500,7 @@ if __name__ == "__main__":
             # ref_ids hämtas från df_multi efter max_refs-begränsning (inte från refs-listan)
             ref_ids = [col for col in df_multi.columns if col != "base"]
             print(f"\nAnvänder {len(ref_ids)} referensrör: {ref_ids}")
-            print(f"Gemensamt dataset: {len(df_multi)} veckor "
+            print(f"Gemensamt dataset: {len(df_multi)} {tidstyp} "
                   f"({df_multi.index[0].date()} – {df_multi.index[-1].date()})")
             print(f"Saknade i base: {df_multi['base'].isna().sum()}")
             for rid in ref_ids:
@@ -1411,11 +1508,11 @@ if __name__ == "__main__":
 
             # Anpassa modellen
             print("\n=== Anpassar multivariat modell ===")
-            result_multi, model_multi = fit_model_multi(df_multi, nseason=26)
+            result_multi, model_multi = fit_model_multi(df_multi, nseason=nseason)
 
-            # Kör Kalman smoother + prognos (26 veckor = ~6 månader)
+            # Kör Kalman smoother + prognos
             print("\n=== Kör Kalman smoother + prognos (multivariat) ===")
-            out_multi = smooth_and_forecast(result_multi, df_multi, n_forecast=26)
+            out_multi = smooth_and_forecast(result_multi, df_multi, n_forecast=nseason)
 
             # Imputation-rapport
             imputed_multi = imputation_report(df_multi, out_multi)
