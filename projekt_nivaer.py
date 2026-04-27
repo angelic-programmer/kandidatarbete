@@ -297,7 +297,7 @@ def dataframe_multi(
 
 """
 ─────────────────────────────────────────────
-ENVARIAT MODELL (ett referensrör)
+UNIVARIABEL MODELL (ett referensrör) 
 ─────────────────────────────────────────────
 
 Modellen är en local level-modell utan trend och utan säsong.
@@ -306,11 +306,12 @@ skattas fritt via MLE, om σ²_η > 0 är nivån stokastisk,
 om MLE skattar σ²_η nära noll beter sig nivån deterministiskt.
 
 Tillståndsekvation (random walk):
-µ(t+1) = µ(t) + η(t+1),   η(t+1) ~ N(0, σ²_η)
+α(t+1) = α(t) + η(t+1),   η(t+1) ~ N(0, σ²_η)
 
 Observationsekvationer:
-y_base(t) = µ(t)                              (σ²_ε,base = 0, exakt observation) juste µ(t)=nivån!               FRÅGA ISAK OM MÖJLIGT MED FELET=0!!!            
-y_ref(t)  = β · µ(t) + ε_ref(t),             ε_ref(t) ~ N(0, σ²_ε,ref)
+y_base(t) = α(t)                           α(t) är grundvattennivån i meter över havet för basröret, notation från boken
+y_ref(t)  = β · α(t)  + ε_ref(t),             ε_ref(t) ~ N(0, σ²_ε,ref)
+
 
 Parametrar som skattas via MLE (3 st):
 σ²_η      varians för vad boken kallar disturbance  η(t+1)
@@ -318,7 +319,7 @@ Parametrar som skattas via MLE (3 st):
 β         koefecienten mellan latent nivå och referensröret
 
 
-För vår modell med två observationsserier och en skalär latent nivå µ_t specificeras systemmatriserna som:
+För vår modell med två observationsserier och en skalär latent nivå α_t specificeras systemmatriserna som:
 Designmatris Z ∈ ℝ^{2×1}:
 Z = [1; β]
 
@@ -327,8 +328,7 @@ H = diag(0, σ²_ε,ref)
 """
 
 
-
-class GroundwaterSSM(MLEModel):
+class GroundwaterSSM(MLEModel): #MLE model är från statmodels
 
     def __init__(self, endog, **extra):
         super().__init__(
@@ -399,9 +399,9 @@ class GroundwaterSSM(MLEModel):
         self.ssm["transition"] = np.array([[1.0]])
 
         #Observationsmatris Z ∈ ℝ^{2×1} 
-        #Kopplar den latenta nivån µ(t) till de två observationerna:
-        #y_base(t) = 1· µ(t)   ← basröret mäter nivån direkt
-        #y_ref(t)  = β· µ(t)   ← referensröret skalat med β
+        #Kopplar den latenta nivån α(t) till de två observationerna:
+        #y_base(t) = 1· α(t)   ← basröret mäter nivån direkt
+        #y_ref(t)  = β· α(t)   ← referensröret skalat med β
         # β skattas fritt av MLE 
         self.ssm["design"] = np.array([[1.0],
                         [beta_ref]])
