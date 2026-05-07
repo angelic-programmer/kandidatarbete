@@ -294,9 +294,11 @@ def plot_results(
     ci[0, :] = np.nan
     smoothed[0] = np.nan
 
-    # Konfidensintervall
+    # Konfidensintervall (interpolera över eventuella NaN så bandet blir kontinuerligt)
+    ci_lower = pd.Series(ci[:, 0], index=idx).interpolate(method="index").values
+    ci_upper = pd.Series(ci[:, 1], index=idx).interpolate(method="index").values
     ax.fill_between(
-        idx, ci[:, 0], ci[:, 1],
+        idx, ci_lower, ci_upper,
         color="steelblue", alpha=0.20,
         label="95% konfidensintervall",
     )
@@ -353,12 +355,12 @@ def plot_results(
     plt.setp(ax.xaxis.get_majorticklabels(), rotation=30)
     ax.grid(alpha=0.3)
 
-    # Begränsa y-axeln till rimliga värden
-    obs_clean = obs[~np.isnan(obs)]
-    if len(obs_clean) > 0:
-        ymin = obs_clean.min() - 1
-        ymax = obs_clean.max() + 1
-        ax.set_ylim(ymin, ymax)
+    # Begränsa y-axeln till rimliga värden (inkludera CI-bandet)
+    all_vals = np.concatenate([obs[~np.isnan(obs)], ci_lower[~np.isnan(ci_lower)], ci_upper[~np.isnan(ci_upper)]])
+    if len(all_vals) > 0:
+        margin = (all_vals.max() - all_vals.min()) * 0.05
+        margin = max(margin, 0.1)
+        ax.set_ylim(all_vals.min() - margin, all_vals.max() + margin)
 
     plt.tight_layout()
     return fig
