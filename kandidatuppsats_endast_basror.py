@@ -48,9 +48,10 @@ except ImportError:
 
 class LocalLevel(MLEModel):
 
-    # Parametrar som MLE ska skatta: σ²_ε och σ²_η
-    start_params = [1.0, 1.0]
-    param_names = ["sigma2.irregular", "sigma2.level"]
+    # Endast σ²_η skattas via MLE; σ²_ε är hårdkodad till 0.1² = 0.01
+    start_params = [1.0]
+    param_names = ["sigma2.level"]
+    SIGMA2_EPS = 0.1**2  # = 0.01, fast observationsvarians
 
     def __init__(self, endog):
         super().__init__(endog, k_states=1)
@@ -64,11 +65,14 @@ class LocalLevel(MLEModel):
         # R = 1
         self["selection", 0, 0] = 1.0
 
+        # H = σ²_ε: hårdkodad
+        self["obs_cov", 0, 0] = self.SIGMA2_EPS
+
         # Diffus initiering, inget antagande om startvärde
         self.initialize_approximate_diffuse()
 
     def transform_params(self, params):
-        # Kvadrering säkerställer att varianserna alltid är positiva
+        # Kvadrering säkerställer att variansen alltid är positiv
         return params**2
 
     def untransform_params(self, params):
@@ -77,11 +81,8 @@ class LocalLevel(MLEModel):
     def update(self, params, **kwargs):
         params = super().update(params, **kwargs)
 
-        # H = σ²_ε: observationsbruset
-        self["obs_cov", 0, 0] = params[0]
-
         # Q = σ²_η: processbruset (hur mycket nivån rör sig)
-        self["state_cov", 0, 0] = params[1]
+        self["state_cov", 0, 0] = params[0]
 
 
 #får in alla filer på samma ställe som detta skript
@@ -179,13 +180,8 @@ def fit_model(y: pd.Series) -> dict:
     #variansen för smoothed nivån
     smoothed_level_var = results.smoothed_state_cov[0, 0, :]
 
-    # results.params innehåller de skattade parametrarna, så de görs om till en numpy arrey för enklare indexering
-    params = np.array(results.params)
-    # En lista med parameterna
-    param_names = list(results.param_names)
-    sigma2_eps = 0
-    if "sigma2.irregular" in param_names:
-        sigma2_eps = params[param_names.index("sigma2.irregular")]
+    # σ²_ε är hårdkodad i modellen
+    sigma2_eps = LocalLevel.SIGMA2_EPS
 
     # Beräknar 95%-konfidensintervall för den smoothed nivån
     z95 = sp_stats.norm.ppf(0.975) 
@@ -261,6 +257,8 @@ def evaluate_model(out: dict, station_id: str = "") -> dict:
 
     print(f"\n  DIAGNOSTIK: {station_id}")
     print(f"  {'-'*40}")
+    print(f"  {'σ²_ε (obs-brus)':<20} {LocalLevel.SIGMA2_EPS:.6f} (fast)")
+    print(f"  {'σ²_η (process-brus)':<20} {out['results'].params.iloc[0]:.6f}")
     print(f"  {'MAE':<20} {metrics['MAE']:.4f}")
     print(f"  {'RMSE':<20} {metrics['RMSE']:.4f}")
     print(f"  {'Durbin-Watson':<20} {metrics.get('Durbin-Watson', float('nan')):.4f}")
@@ -510,3 +508,6 @@ if __name__ == "__main__":
                 f"{m.get('Durbin-Watson', float('nan')):>8.4f}"
             )
         print("=" * 55)
+
+
+
