@@ -1,28 +1,27 @@
 """
-State Space Model: Local Level (Durbin & Koopman, 2012, ekvation 2.3)
-Modellen är den enklaste formen av en state space-modell. Den latenta
-grundvattennivån μ_t följer en random walk.
+ (Durbin & Koopman, 2012, ekvation 2.3):
 
-Observationsekvation:
-    y_t     = μ_t + ε_t,       ε_t ~ N(0, σ²_ε)
-
-Tillståndsekvation:
+    y_t     = μ_t + ε_t,       ε_t ~ N(0, σ²_ε) 
     μ_{t+1} = μ_t + η_t,      η_t ~ N(0, σ²_η)
 
-Modellen är ett specialfall av den generella state space-formen
-(Durbin & Koopman, 2012, ekvation 3.1) där alla systemmatriser
-är skalärer (1×1) eftersom modellen har ett tillstånd och en
-observation:
+Matriserna sätts explicit i LocalLevel-klassen:
+    Z = 1   (design)
+    T = 1   (transition)
+    R = 1   (selection)
+    H = σ²_ε  (obs_cov, skattas via MLE)
+    Q = σ²_η  (state_cov, skattas via MLE)
 
-    Z = 1   (designmatrisen=1)
-    T = 1   (transformationsmatrisen=1)
-    R = 1   (störningen kopplas direkt till tillståndet)
-    H = σ²_ε  (observationsbrus, skattas via MLE)
-    Q = σ²_η  (processbrus, skattas via MLE)
+Skattning sker i tre steg:
+  1. model.fit() kör MLE via L-BFGS-optimering och maximerar
+     log-likelihood för att hitta σ²_ε och σ²_η.
 
-Kalman-smoothern används för att skatta den
-latenta nivån μ_t givet observationerna, och för att komplettera
-saknade grundvattennivåer med tillhörande konfidensintervall.
+  2. Kalman-smoothern (results.smoothed_state) ger den bästa
+     skattningen av μ_t givet ALLA observationer y_1,...,y_n.
+     Används för imputation (prediktion) och visualisering.
+
+  3. Kalman-filtret (results.filter_results.forecasts) ger
+     one-step-ahead-prediktioner. Används för utvärdering
+     (MAE, RMSE, DW) eftersom det är en rättvis prediktion.
 """
 
 import sys, io
@@ -40,11 +39,49 @@ import warnings
 warnings.filterwarnings("ignore")
 
 try:
-    from statsmodels.tsa.statespace.structural import UnobservedComponents
+    from statsmodels.tsa.statespace.mlemodel import MLEModel
     from statsmodels.stats.stattools import durbin_watson
     from statsmodels.tsa.stattools import acf as sm_acf
 except ImportError:
     raise ImportError("Installera statsmodels: pip install statsmodels")
+
+
+class LocalLevel(MLEModel):
+
+    # Parametrar som MLE ska skatta: σ²_ε och σ²_η
+    start_params = [1.0, 1.0]
+    param_names = ["sigma2.irregular", "sigma2.level"]
+
+    def __init__(self, endog):
+        super().__init__(endog, k_states=1)
+
+        # Z = 1
+        self["design", 0, 0] = 1.0
+
+        # T = 1
+        self["transition", 0, 0] = 1.0
+
+        # R = 1
+        self["selection", 0, 0] = 1.0
+
+        # Diffus initiering, inget antagande om startvärde
+        self.initialize_approximate_diffuse()
+
+    def transform_params(self, params):
+        # Kvadrering säkerställer att varianserna alltid är positiva
+        return params**2
+
+    def untransform_params(self, params):
+        return params**0.5
+
+    def update(self, params, **kwargs):
+        params = super().update(params, **kwargs)
+
+        # H = σ²_ε: observationsbruset
+        self["obs_cov", 0, 0] = params[0]
+
+        # Q = σ²_η: processbruset (hur mycket nivån rör sig)
+        self["state_cov", 0, 0] = params[1]
 
 
 #får in alla filer på samma ställe som detta skript
@@ -52,7 +89,7 @@ basror_22W102  = Path(__file__).parent / "22W102.csv"
 basror_17XX01U = Path(__file__).parent / "17XX01U.csv"
 basror_G1101   = Path(__file__).parent / "G1101.csv"
 
-#nedan ser vi att basrör 22W102=rör A, G1101=rör B, 17XX01U=rör C
+#nedan ser vi att observationsrör 22W102=rör A, G1101=rör B, 17XX01U=rör C
 STATIONS = [
     (basror_22W102, "Rör A"),
     (basror_G1101, "Rör B"),
@@ -128,36 +165,12 @@ def prepare_series(series: pd.Series, freq: str) -> pd.Series:
     return resampled
 
 
-"""
-MODELLANPASSNING
-Anpassar local level-modellen (Durbin & Koopman, 2012, ekvation 2.3):
 
-    y_t     = μ_t + ε_t,       ε_t ~ N(0, σ²_ε) 
-    μ_{t+1} = μ_t + η_t,      η_t ~ N(0, σ²_η)
-
-
-UnobservedComponents(y, level="local level") sätter automatiskt matriserna
-till skalärer: Z=1, T=1, R=1, H=σ²_ε, Q=σ²_η. Vilket är det vi vill ha för denna 
-enkla version av state space models som specificeras i ekvation 2.3
-
-Skattning sker i tre steg:
-  1. model.fit() kör MLE via L-BFGS-optimering och maximerar
-     log-likelihood för att hitta σ²_ε och σ²_η.
-
-
-  2. Kalman-smoothern (results.smoothed_state) ger den bästa
-     skattningen av μ_t givet ALLA observationer y_1,...,y_n.
-     Används för komplettering/imputation och visualisering.
-
-  3. Kalman-filtret (results.filter_results.forecasts) ger
-     one-step-ahead-prediktioner. Används för utvärdering
-     (MAE, RMSE, DW) eftersom det är en rättvis prediktion.
-"""
 
 
 def fit_model(y: pd.Series) -> dict:
-    #modelstrukturen skapas, y=tidserien, att level=local level innebär att Z=1, T=1, R=1, H=σ²_ε, Q=σ²_η
-    model = UnobservedComponents(y, level="local level")
+    #modelstrukturen skapas
+    model = LocalLevel(y)
     #lbfgs optimeringen testar olika värden på σ²_ε och σ²_η för att hitta de som maximerar log-likelihood    
     # maxiter=2000 ger optimeraren upp efter 2000 försök, disp=False döljer utskriften 
     results = model.fit(method="lbfgs", maxiter=2000, disp=False)
@@ -209,13 +222,13 @@ def fit_model(y: pd.Series) -> dict:
 
 
 """
-Utvärderings mått: MAE, RMSE, Durbin-Watson, 95%-täckning.
+Utvärderings mått: MAE, RMSE, Durbin-Watson.
 """
 
 def evaluate_model(out: dict, station_id: str = "") -> dict:
 
     obs = out["observed_base"]
-    pred = out["filter_pred_base"]
+    pred = out["pred_base"]
 
     # Mask: tidpunkter med faktisk observation OCH giltig prediktion
     valid = ~np.isnan(obs) & ~np.isnan(pred)
@@ -234,12 +247,6 @@ def evaluate_model(out: dict, station_id: str = "") -> dict:
         "RMSE":           float(np.sqrt(np.mean(resid_eval**2))),
     }
 
-    # Hur mycket som är inom 95% konfidensintervallet för one-step-ahead prediktionerna
-    ci = out["filter_pred_ci"]
-    ci_valid = ci[valid][burn:]
-    inside = (o_eval >= ci_valid[:, 0]) & (o_eval <= ci_valid[:, 1])
-    metrics["95%-täckning"] = float(inside.mean())
-
     #Durbin-Watson 
     obs_mask = ~np.isnan(obs)
     try:
@@ -256,7 +263,6 @@ def evaluate_model(out: dict, station_id: str = "") -> dict:
     print(f"  {'-'*40}")
     print(f"  {'MAE':<20} {metrics['MAE']:.4f}")
     print(f"  {'RMSE':<20} {metrics['RMSE']:.4f}")
-    print(f"  {'95%-täckning':<20} {metrics['95%-täckning']:.1%}")
     print(f"  {'Durbin-Watson':<20} {metrics.get('Durbin-Watson', float('nan')):.4f}")
     print(f"  {'-'*40}")
 
@@ -264,7 +270,7 @@ def evaluate_model(out: dict, station_id: str = "") -> dict:
 
 
 
-#visualisering  kommentera senare för kommer nog ändra här lite har inte helt bästämt mig om jag vill ha de som alisons 
+#visualisering
 def plot_results(
     out: dict,
     station_id: str = "22W102",
@@ -273,7 +279,7 @@ def plot_results(
     fig, ax = plt.subplots(figsize=(14, 6))
     fig.suptitle(
         "Grundvatten State Space Model — Local Level\n"
-        f"Basobjekt: {station_id}",
+        f"Observationsrör: {station_id}",
         fontsize=14, fontweight="bold",
     )
 
@@ -295,12 +301,36 @@ def plot_results(
         label="95% konfidensintervall",
     )
 
-    # Observationer
+    # y_t — observerad nivå (linje)
+    # y_t — observerad nivå
     obs_valid = ~np.isnan(obs)
+    obs_dates = idx[obs_valid]
+    obs_vals = obs[obs_valid]
+
+    # Dra linje bara mellan observationer som ligger nära varandra
+    # Beräkna max tillåtet gap (3x mediangapet)
+    if len(obs_dates) > 1:
+        gaps = np.diff(obs_dates).astype("timedelta64[D]").astype(float)
+        max_gap = np.median(gaps) * 3
+        # Sätt NaN i serien där gapet är för stort → bryter linjen
+        obs_plot = obs_vals.copy()
+        for i in range(1, len(gaps)):
+            if gaps[i] > max_gap:
+                obs_plot[i] = np.nan  # bryter linjen här
+    else:
+        obs_plot = obs_vals
+
     ax.plot(
-        idx[obs_valid], obs[obs_valid],
-        "o", color="navy", ms=3, alpha=0.7,
-        label=f"Observation ({station_id})",
+        obs_dates, obs_plot,
+        "o-", color="navy", linewidth=1.0, ms=2, alpha=0.7,
+        label=r"$y_t$ (observation)",
+    )
+
+    # μ_t — smoothad latent nivå
+    ax.plot(
+        idx, smoothed,
+        color="darkorange", linewidth=2.0, linestyle="--",
+        label=r"$\mu_t$ (latent nivå)",
     )
 
     # Imputerade värden (smoothed level där observation saknas)
@@ -371,7 +401,7 @@ def plot_acf_residuals(out: dict, station_id: str, lags: int = 20) -> plt.Figure
     )
     ax.set_xlabel("Lag")
     ax.set_ylabel("Autokorrelation")
-    ax.grid(True)
+    ax.grid(True, alpha=0.3)
     plt.tight_layout()
     return fig
 
@@ -390,7 +420,7 @@ def plot_histogram_residuals(out: dict, station_id: str) -> plt.Figure:
 
     fig, ax = plt.subplots(figsize=(8, 5))
 
-    ax.hist(residualer, bins="auto", density=True, alpha=0.7,
+    ax.hist(residualer, bins=20, density=True, alpha=0.7,
             color="steelblue", edgecolor="white", label="Residualer")
 
     mu, sigma = residualer.mean(), residualer.std()
@@ -447,7 +477,7 @@ if __name__ == "__main__":
         plt.close(fig)
 
         # ACF-plot för residualer
-        fig_acf = plot_acf_residuals(out, display_name)
+        fig_acf = plot_acf_residuals(out, display_name, lags=10)
         if fig_acf is not None:
             acf_path = f"acf_residuals_{file_id}.png"
             fig_acf.savefig(acf_path, dpi=150, bbox_inches="tight")
@@ -467,7 +497,7 @@ if __name__ == "__main__":
         print("\n\n" + "=" * 55)
         print(" SAMMANFATTNING AV ALLA STATIONER")
         print("=" * 55)
-        header = f"  {'Station':<12} {'MAE':>8} {'RMSE':>8} {'95%-täck':>10} {'DW':>8}"
+        header = f"  {'Station':<12} {'MAE':>8} {'RMSE':>8} {'DW':>8}"
         print(header)
         print("  " + "-" * (len(header) - 2))
         for sid, m in all_metrics.items():
@@ -475,9 +505,6 @@ if __name__ == "__main__":
                 f"  {sid:<12} "
                 f"{m.get('MAE', float('nan')):>8.4f} "
                 f"{m.get('RMSE', float('nan')):>8.4f} "
-                f"{m.get('95%-täckning', float('nan')):>9.1%} "
                 f"{m.get('Durbin-Watson', float('nan')):>8.4f}"
             )
         print("=" * 55)
-
-    
