@@ -371,7 +371,7 @@ def plot_acf_residuals(out: dict, station_id: str, lags: int = 20) -> plt.Figure
     Lodräta staplar, streckade CI-linjer, grid.
     """
     obs  = out["observed_base"]
-    pred = out["filter_pred_base"].flatten()[:len(obs)]
+    pred = out["pred_base"].flatten()[:len(obs)]
     residualer = obs - pred
 
     residualer_series = pd.Series(residualer).dropna()
@@ -407,7 +407,7 @@ def plot_histogram_residuals(out: dict, station_id: str) -> plt.Figure:
     Histogram av residualerna med överlagrad normalfördelningskurva.
     """
     obs = out["observed_base"]
-    pred = out["filter_pred_base"].flatten()[:len(obs)]
+    pred = out["pred_base"].flatten()[:len(obs)]
     residualer = pd.Series(obs - pred).dropna().values
 
     if len(residualer) < 10:
@@ -416,7 +416,7 @@ def plot_histogram_residuals(out: dict, station_id: str) -> plt.Figure:
 
     fig, ax = plt.subplots(figsize=(8, 5))
 
-    ax.hist(residualer, bins=40, density=True, alpha=0.7,
+    ax.hist(residualer, bins="auto", density=True, alpha=0.7,
             color="steelblue", edgecolor="white", label="Residualer")
 
     mu, sigma = residualer.mean(), residualer.std()
@@ -442,7 +442,7 @@ def plot_residuals_over_time(out: dict, station_id: str) -> plt.Figure:
     obs = out["observed_base"]
 
     # one-step-ahead prediction från Kalman-filtret
-    pred = out["filter_pred_base"].flatten()[:len(obs)]
+    pred = out["pred_base"].flatten()[:len(obs)]
 
     residuals = obs - pred
 
