@@ -394,10 +394,7 @@ def plot_acf_residuals(out: dict, station_id: str, lags: int = 20) -> plt.Figure
     ax.axhline( ci_bound, linestyle="--", color="steelblue", linewidth=0.9)
     ax.axhline(-ci_bound, linestyle="--", color="steelblue", linewidth=0.9)
 
-    ax.set_title(
-        f"ACF för residualer — Local Level ({station_id})",
-        fontsize=14, fontweight="bold",
-    )
+
     ax.set_xlabel("Lag")
     ax.set_ylabel("Autokorrelation")
     ax.grid(True, alpha=0.3)
