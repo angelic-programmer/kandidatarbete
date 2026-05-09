@@ -276,8 +276,7 @@ def plot_results(
 
     fig, ax = plt.subplots(figsize=(14, 6))
     fig.suptitle(
-        "Grundvatten State Space Model — Local Level\n"
-        f"Observationsrör: {station_id}",
+        f"State space referensrörsmodell observationsrör: {station_id}",
         fontsize=14, fontweight="bold",
     )
 
