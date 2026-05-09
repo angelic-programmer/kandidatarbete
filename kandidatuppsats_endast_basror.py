@@ -419,7 +419,7 @@ def plot_histogram_residuals(out: dict, station_id: str) -> plt.Figure:
 
     fig, ax = plt.subplots(figsize=(8, 5))
 
-    ax.hist(residualer, bins=20, density=True, alpha=0.7,
+    ax.hist(residualer, bins=40, density=True, alpha=0.7,
             color="steelblue", edgecolor="white", label="Residualer")
 
     mu, sigma = residualer.mean(), residualer.std()
@@ -427,10 +427,7 @@ def plot_histogram_residuals(out: dict, station_id: str) -> plt.Figure:
     ax.plot(x, sp_stats.norm.pdf(x, mu, sigma),
             color="red", lw=2, label=f"N({mu:.4f}, {sigma:.4f}²)")
 
-    ax.set_title(
-        f"Histogram av residualer — Local Level ({station_id})",
-        fontsize=14, fontweight="bold",
-    )
+
     ax.set_xlabel("Residual (m)")
     ax.set_ylabel("Densitet")
     ax.legend()
@@ -439,7 +436,64 @@ def plot_histogram_residuals(out: dict, station_id: str) -> plt.Figure:
     return fig
 
 
+def plot_residuals_over_time(out: dict, station_id: str) -> plt.Figure:
+    """
+    Residualer över tid:
+    residual = observation - one-step-ahead prediction
+    """
 
+    obs = out["observed_base"]
+
+    # one-step-ahead prediction från Kalman-filtret
+    pred = out["filter_pred_base"].flatten()[:len(obs)]
+
+    residuals = obs - pred
+
+    # Tar bort NaN
+    valid = ~np.isnan(residuals)
+
+    dates = out["index"][valid]
+    residuals = residuals[valid]
+
+    if len(residuals) < 5:
+        print("  För få residualer för residualplot")
+        return None
+
+    fig, ax = plt.subplots(figsize=(14, 6))
+
+
+    # Residualserie
+    ax.plot(
+        dates,
+        residuals,
+        "o-",
+        color="steelblue",
+        linewidth=1.2,
+        markersize=3,
+        alpha=0.8,
+    )
+
+    # Horisontell linje vid 0
+    ax.axhline(0, color="black", linewidth=0.8)
+
+    ax.set_xlabel("Datum")
+    ax.set_ylabel("Residual")
+
+    # Datumformat
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
+
+    n_months = (dates[-1] - dates[0]).days / 30
+    interval = max(4, int(n_months / 8))
+
+    ax.xaxis.set_major_locator(mdates.MonthLocator(interval=interval))
+
+    plt.setp(ax.xaxis.get_majorticklabels(), rotation=30)
+
+    ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+
+    return fig
 
 
 if __name__ == "__main__":
@@ -490,6 +544,23 @@ if __name__ == "__main__":
             fig_hist.savefig(hist_path, dpi=150, bbox_inches="tight")
             print(f"  Histogram sparad: {hist_path}")
             plt.close(fig_hist)
+
+
+        # Residualer över tid
+        fig_resid = plot_residuals_over_time(out, display_name)
+
+        if fig_resid is not None:
+            resid_path = f"residuals_over_time_{file_id}.png"
+
+            fig_resid.savefig(
+                resid_path,
+                dpi=150,
+                bbox_inches="tight"
+            )
+
+            print(f"  Residualplot sparad: {resid_path}")
+
+            plt.close(fig_resid)
 
     # ── Sammanfattning ──
     if all_metrics:
