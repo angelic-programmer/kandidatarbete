@@ -276,7 +276,7 @@ def plot_results(
 
     fig, ax = plt.subplots(figsize=(14, 6))
     fig.suptitle(
-        f"State space referensrörsmodell observationsrör: {station_id}",
+        f"State space observationsrör: {station_id}",
         fontsize=14, fontweight="bold",
     )
 
