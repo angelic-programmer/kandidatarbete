@@ -338,7 +338,7 @@ def plot_results(
         ax.plot(
             idx[obs_missing], smoothed[obs_missing],
             "o", color="crimson", ms=4, alpha=0.9,
-            label="Imputerade värden",
+            label="Predikterade värden",
         )
 
     ax.set_ylabel("Nivå (m ö.h.)")
