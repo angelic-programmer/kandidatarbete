@@ -88,7 +88,7 @@ class LocalLevel(MLEModel):
 #får in alla filer på samma ställe som detta skript
 basror_22W102  = Path(__file__).parent / "22W102.csv"
 basror_17XX01U = Path(__file__).parent / "17XX01U.csv"
-basror_G1101   = Path(__file__).parent / "G1101.csv"
+basror_G1101   = Path("/home/angelica/Hämtningar/obs2.csv")
 
 #nedan ser vi att observationsrör 22W102=rör A, G1101=rör B, 17XX01U=rör C
 STATIONS = [
@@ -276,7 +276,8 @@ def plot_results(
 
     fig, ax = plt.subplots(figsize=(14, 6))
     fig.suptitle(
-        f"State space observationsrör: {station_id}",
+        "State Space Model (Local Level)\n"
+        f"Observationsrör: {station_id}",
         fontsize=14, fontweight="bold",
     )
 
@@ -300,66 +301,43 @@ def plot_results(
         label="95% konfidensintervall",
     )
 
-    # y_t — observerad nivå (linje)
-    # y_t — observerad nivå
-    obs_valid = ~np.isnan(obs)
-    obs_dates = idx[obs_valid]
-    obs_vals = obs[obs_valid]
-
-    # Dra linje bara mellan observationer som ligger nära varandra
-    # Beräkna max tillåtet gap (3x mediangapet)
-    if len(obs_dates) > 1:
-        gaps = np.diff(obs_dates).astype("timedelta64[D]").astype(float)
-        max_gap = np.median(gaps) * 3
-        # Sätt NaN i serien där gapet är för stort → bryter linjen
-        obs_plot = obs_vals.copy()
-        for i in range(1, len(gaps)):
-            if gaps[i] > max_gap:
-                obs_plot[i] = np.nan  # bryter linjen här
-    else:
-        obs_plot = obs_vals
-
-    ax.plot(
-        obs_dates, obs_plot,
-        "o-", color="navy", linewidth=1.0, ms=2, alpha=0.7,
-        label=r"$y_t$ (observation)",
-    )
-
     # μ_t — smoothad latent nivå
     ax.plot(
         idx, smoothed,
-        color="darkorange", linewidth=2.0, linestyle="--",
-        label=r"$\mu_t$ (latent nivå)",
+        linestyle="-", linewidth=1.4, color="crimson",
+        label=r"$\mu_t$ (latent nivå) predikterad serie",
     )
 
-    # Imputerade värden (smoothed level där observation saknas)
-    obs_missing = np.isnan(obs)
-    if np.any(obs_missing):
-        ax.plot(
-            idx[obs_missing], smoothed[obs_missing],
-            "o", color="crimson", ms=4, alpha=0.9,
-            label="Predikterade värden",
-        )
+    # y_t — observerad nivå (enbart prickar)
+    obs_valid = ~np.isnan(obs)
+    ax.plot(
+        idx[obs_valid], obs[obs_valid],
+        "o", color="navy", markersize=3, alpha=0.75,
+        label=r"$y_t$ (observation)",
+    )
 
-    ax.set_ylabel("Nivå (m ö.h.)")
     ax.set_xlabel("Datum")
+    ax.set_ylabel("Nivå (m ö.h.)")
     ax.legend(loc="upper left", fontsize=8)
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
-    # Anpassa x-axelns intervall efter tidsspannets längd
+
+    # Datumaxel
     n_months = (idx[-1] - idx[0]).days / 30
     interval = max(4, int(n_months / 8))
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
     ax.xaxis.set_major_locator(mdates.MonthLocator(interval=interval))
     plt.setp(ax.xaxis.get_majorticklabels(), rotation=30)
-    ax.grid(alpha=0.3)
 
-    # Begränsa y-axeln till rimliga värden (inkludera CI-bandet)
-    all_vals = np.concatenate([obs[~np.isnan(obs)], ci_lower[~np.isnan(ci_lower)], ci_upper[~np.isnan(ci_upper)]])
+    ax.grid(True, alpha=0.3)
+
+    # Fast ±0.5 marginal på y-axeln
+    all_vals = pd.concat([
+        pd.Series(obs[~np.isnan(obs)]),
+        pd.Series(smoothed[~np.isnan(smoothed)]),
+    ]).dropna()
     if len(all_vals) > 0:
-        margin = (all_vals.max() - all_vals.min()) * 0.05
-        margin = max(margin, 0.1)
-        ax.set_ylim(all_vals.min() - margin, all_vals.max() + margin)
+        ax.set_ylim(all_vals.min() - 0.5, all_vals.max() + 0.5)
 
-    plt.tight_layout()
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
     return fig
 
 
